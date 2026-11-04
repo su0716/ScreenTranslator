@@ -29,10 +29,12 @@ import android.os.Looper
 import android.util.DisplayMetrics
 import android.view.Display
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
+import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import com.google.android.gms.tasks.Tasks
@@ -145,6 +147,7 @@ class CaptureService : Service() {
     }
 
     private fun teardown() {
+        hideLangMenu()
         removeOverlay()
         button?.let { runCatching { wm.removeView(it) } }
         button = null
@@ -307,12 +310,15 @@ class CaptureService : Service() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
+    private fun buttonLabel() = "번역\n${lang.short}"
+
     @SuppressLint("ClickableViewAccessibility")
     private fun showButton() {
         val size = dp(56)
         val tv = TextView(this).apply {
-            text = "번역"
-            textSize = 13f
+            text = buttonLabel()
+            textSize = 12f
+            setLineSpacing(0f, 0.9f)
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
             background = GradientDrawable().apply {
@@ -333,23 +339,36 @@ class CaptureService : Service() {
         }
 
         val slop = ViewConfiguration.get(this).scaledTouchSlop
+        val longPressMs = ViewConfiguration.getLongPressTimeout().toLong()
         var downX = 0f
         var downY = 0f
         var startX = 0
         var startY = 0
         var moved = false
+        var longPressed = false
+        val longPress = Runnable {
+            longPressed = true
+            tv.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            showLangMenu()
+        }
         tv.setOnTouchListener { v, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     downX = e.rawX; downY = e.rawY
                     startX = buttonParams.x; startY = buttonParams.y
                     moved = false
+                    longPressed = false
+                    main.postDelayed(longPress, longPressMs)
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = e.rawX - downX
                     val dy = e.rawY - downY
-                    if (!moved && (abs(dx) > slop || abs(dy) > slop)) moved = true
+                    if (!moved && !longPressed && (abs(dx) > slop || abs(dy) > slop)) {
+                        moved = true
+                        main.removeCallbacks(longPress)
+                        hideLangMenu()
+                    }
                     if (moved) {
                         buttonParams.x = startX + dx.toInt()
                         buttonParams.y = startY + dy.toInt()
@@ -358,7 +377,12 @@ class CaptureService : Service() {
                     true
                 }
                 MotionEvent.ACTION_UP -> {
-                    if (!moved) onButtonTap()
+                    main.removeCallbacks(longPress)
+                    if (!moved && !longPressed) onButtonTap()
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    main.removeCallbacks(longPress)
                     true
                 }
                 else -> false
@@ -373,6 +397,98 @@ class CaptureService : Service() {
         button?.visibility = if (visible) View.VISIBLE else View.INVISIBLE
     }
 
+    // ---------------- 언어 선택 메뉴 (버튼 길게 누르기) ----------------
+
+    private var langMenu: View? = null
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun showLangMenu() {
+        hideLangMenu()
+        val btnSize = dp(56)
+        val menuW = dp(104)
+        val menu = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(14).toFloat()
+                setColor(Color.argb(240, 30, 30, 34))
+            }
+        }
+        SourceLang.values().forEach { l ->
+            val selected = l == lang
+            menu.addView(TextView(this).apply {
+                text = if (selected) "✓ ${l.label}" else l.label
+                textSize = 15f
+                gravity = Gravity.CENTER
+                setTextColor(Color.WHITE)
+                setPadding(0, dp(10), 0, dp(10))
+                if (selected) background = GradientDrawable().apply {
+                    cornerRadius = dp(10).toFloat()
+                    setColor(Color.parseColor("#2F6BFF"))
+                }
+                setOnClickListener {
+                    hideLangMenu()
+                    switchLang(l)
+                }
+            })
+        }
+        // 버튼이 화면 오른쪽에 있으면 메뉴는 왼쪽, 아니면 오른쪽에
+        val onRight = buttonParams.x + btnSize / 2 > screenW / 2
+        val p = WindowManager.LayoutParams(
+            menuW, WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = if (onRight) buttonParams.x - menuW - dp(8) else buttonParams.x + btnSize + dp(8)
+            y = buttonParams.y
+        }
+        // 메뉴 바깥을 누르면 닫기
+        menu.setOnTouchListener { _, e ->
+            if (e.actionMasked == MotionEvent.ACTION_OUTSIDE) {
+                hideLangMenu()
+                true
+            } else false
+        }
+        wm.addView(menu, p)
+        langMenu = menu
+    }
+
+    private fun hideLangMenu() {
+        langMenu?.let { runCatching { wm.removeView(it) } }
+        langMenu = null
+    }
+
+    private fun switchLang(l: SourceLang) {
+        if (l == lang) return
+        if (busy) {
+            toast("번역 중엔 바꿀 수 없어")
+            return
+        }
+        removeOverlay()
+        recognizer?.close()
+        translator?.close()
+        lang = l
+        Prefs.setSource(this, l)
+        recognizer = l.recognizer()
+        val tr = l.translator()
+        translator = tr
+        setButtonState(buttonLabel())
+        // 번역 모델이 없으면 미리 받아두기
+        busy = true
+        setButtonState("받는중")
+        tr.downloadModelIfNeeded()
+            .addOnSuccessListener { toast("${l.label} → 한국어 준비 완료") }
+            .addOnFailureListener { e -> toast("${l.label} 모델 다운로드 실패 (인터넷 확인): ${e.message}") }
+            .addOnCompleteListener {
+                busy = false
+                setButtonState(buttonLabel())
+            }
+    }
+
     // ---------------- 번역 ----------------
 
     private fun onButtonTap() {
@@ -383,13 +499,13 @@ class CaptureService : Service() {
         }
         busy = true
         // 버튼이 캡처에 찍히지 않게 잠깐 숨기고, 새 프레임이 올 때까지 대기
-        setButtonState("번역", visible = false)
+        setButtonState(buttonLabel(), visible = false)
         main.postDelayed({ captureAndTranslate() }, 300)
     }
 
     private fun finishWork(error: String? = null) {
         busy = false
-        setButtonState("번역")
+        setButtonState(buttonLabel())
         if (error != null) toast(error)
     }
 

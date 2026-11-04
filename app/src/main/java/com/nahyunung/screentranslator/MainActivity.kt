@@ -30,6 +30,7 @@ class MainActivity : Activity() {
 
     private lateinit var status: TextView
     private lateinit var modelBtn: Button
+    private lateinit var langGroup: RadioGroup
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -38,6 +39,8 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        // 떠 있는 버튼에서 언어를 바꿨을 수도 있으니 다시 반영
+        if (::langGroup.isInitialized) langGroup.check(1000 + Prefs.source(this).ordinal)
         refreshStatus()
     }
 
@@ -58,7 +61,7 @@ class MainActivity : Activity() {
             setTextColor(Color.BLACK)
         })
         root.addView(TextView(this).apply {
-            text = "다른 앱 위에 떠 있는 '번역' 버튼을 누르면 지금 화면의 글자를 한국어로 덮어씌워 줘. 번역 화면은 아무 데나 탭하면 닫혀."
+            text = "다른 앱 위에 떠 있는 '번역' 버튼을 누르면 지금 화면의 글자를 한국어로 덮어씌워 줘. 번역 박스는 끌어서 옮길 수 있고, 빈 곳을 탭하면 닫혀. 버튼을 꾹 누르면 언어를 바꿀 수 있어."
             textSize = 14f
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(8), 0, dp(24))
@@ -81,6 +84,7 @@ class MainActivity : Activity() {
             refreshStatus()
         }
         root.addView(group)
+        langGroup = group
 
         root.addView(label("준비").apply { setPadding(0, dp(24), 0, dp(8)) })
         root.addView(bigButton("① 다른 앱 위에 표시 권한 켜기") { openOverlaySettings() })
