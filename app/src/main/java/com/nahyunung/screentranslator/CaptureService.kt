@@ -601,7 +601,10 @@ class CaptureService : Service() {
         val h = screenH
         setButtonState("AI…")
         net.execute {
-            val result = runCatching { GeminiClient.translate(bmp, l, key, model, w, h) }
+            val result = runCatching { GeminiClient.translate(bmp, l, key, model, w, h) { msg ->
+                    main.post { setButtonState(msg) }
+                }
+            }
             bmp.recycle()
             main.post {
                 result.onSuccess { items ->
