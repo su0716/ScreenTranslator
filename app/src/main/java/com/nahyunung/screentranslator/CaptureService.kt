@@ -68,7 +68,7 @@ class CaptureService : Service() {
 
     private lateinit var wm: WindowManager
     private val main = Handler(Looper.getMainLooper())
-    private val net = Executors.newSingleThreadExecutor()
+    private val net = Executors.newCachedThreadPool()
 
     // 캡처
     private var projection: MediaProjection? = null
@@ -150,6 +150,9 @@ class CaptureService : Service() {
     }
 
     private fun teardown() {
+        job++
+        cancelToken?.cancel()
+        main.removeCallbacks(watchdog)
         hideLangMenu()
         removeOverlay()
         button?.let { runCatching { wm.removeView(it) } }
@@ -545,8 +548,26 @@ class CaptureService : Service() {
 
     // ---------------- 번역 ----------------
 
+    /** 지금 작업 번호. 중지하면 올라가서, 늦게 도착한 결과는 무시됨 */
+    private var job = 0
+    private var cancelToken: GeminiClient.CancelToken? = null
+    /** 이 시간 넘게 걸리면 자동으로 중지 (먹통 방지) */
+    private val watchdog = Runnable { cancelWork("너무 오래 걸려서 중지했어. 다시 눌러봐") }
+
+    private fun busyLabel(status: String) = setButtonState("$status\n■중지")
+
+    /** 번역 도중 중지: 네트워크 끊고, 늦게 오는 결과 무시, 버튼 바로 복구 */
+    private fun cancelWork(msg: String) {
+        job++
+        cancelToken?.cancel()
+        finishWork(msg)
+    }
+
     private fun onButtonTap() {
-        if (busy) return
+        if (busy) { // 번역 중에 누르면 중지
+            cancelWork("중지했어")
+            return
+        }
         if (overlay != null) { // 번역 화면 떠 있으면 닫기만
             removeOverlay()
             return
@@ -564,59 +585,66 @@ class CaptureService : Service() {
             return
         }
         busy = true
+        val id = ++job
+        main.removeCallbacks(watchdog)
+        main.postDelayed(watchdog, 60_000)
         // 버튼이 캡처에 찍히지 않게 잠깐 숨기고, 새 프레임이 올 때까지 대기
         setButtonState(buttonLabel(), visible = false)
-        main.postDelayed({ captureAndTranslate() }, 300)
+        main.postDelayed({ captureAndTranslate(id) }, 300)
     }
 
     private fun finishWork(error: String? = null) {
+        main.removeCallbacks(watchdog)
+        cancelToken = null
         busy = false
         setButtonState(buttonLabel())
         if (error != null) toast(error)
     }
 
-    private fun captureAndTranslate() {
+    private fun captureAndTranslate(id: Int) {
+        if (id != job) return // 그새 중지됨
         val bmp = grabBitmap()
-        setButtonState("…")
+        busyLabel("…")
         if (bmp == null) {
             finishWork("화면을 못 가져왔어. 다시 눌러봐")
             return
         }
         if (Prefs.engine(this) == Engine.GEMINI) {
-            translateWithGemini(bmp)
+            translateWithGemini(bmp, id)
             return
         }
         val rec = recognizer ?: return finishWork()
         rec.process(InputImage.fromBitmap(bmp, 0))
-            .addOnSuccessListener { result -> translateBlocks(result) }
-            .addOnFailureListener { e -> finishWork("글자 인식 실패: ${e.message}") }
+            .addOnSuccessListener { result -> if (id == job) translateBlocks(result, id) }
+            .addOnFailureListener { e -> if (id == job) finishWork("글자 인식 실패: ${e.message}") }
             .addOnCompleteListener { bmp.recycle() }
     }
 
-    /** 지금 번역 중인 요청 번호 (사용자가 중간에 닫으면 남은 결과 무시) */
-    private var aiSession = 0
+    /** 스트리밍 중에 사용자가 번역 화면을 닫았는지 (닫았으면 남은 박스 무시) */
     private var aiClosedByUser = false
 
-    private fun translateWithGemini(bmp: Bitmap) {
+    private fun translateWithGemini(bmp: Bitmap, session: Int) {
         val key = Prefs.apiKey(this)
         val model = Prefs.model(this)
         val l = lang
         val w = screenW
         val h = screenH
         val relaxed = Prefs.relaxedSafety(this)
-        val session = ++aiSession
         aiClosedByUser = false
         val started = System.currentTimeMillis()
-        setButtonState("AI…")
+        val token = GeminiClient.CancelToken()
+        cancelToken = token
+        busyLabel("AI…")
         net.execute {
             val result = runCatching {
                 GeminiClient.translate(
                     bmp, l, key, model, w, h,
                     relaxedSafety = relaxed,
-                    onStatus = { msg -> main.post { if (session == aiSession) setButtonState(msg) } },
+                    cancel = token,
+                    onStatus = { msg -> main.post { if (session == job) busyLabel(msg) } },
                     onItem = { item ->
                         main.post {
-                            if (session != aiSession || aiClosedByUser) return@post
+                            if (session != job || aiClosedByUser) return@post
                             // 첫 박스면 오버레이 띄우고, 이후엔 하나씩 추가
                             val ov = overlay
                             if (ov == null) showOverlay(listOf(item)) else ov.addItem(item)
@@ -626,7 +654,7 @@ class CaptureService : Service() {
             }
             bmp.recycle()
             main.post {
-                if (session != aiSession) return@post
+                if (session != job) return@post
                 result.onSuccess { count ->
                     if (count == 0) finishWork("번역할 외국어를 못 찾았어")
                     else {
@@ -647,7 +675,7 @@ class CaptureService : Service() {
     private fun blockText(b: Text.TextBlock): String =
         b.lines.joinToString(if (lang.joinWithSpace) " " else "") { it.text }
 
-    private fun translateBlocks(result: Text) {
+    private fun translateBlocks(result: Text, id: Int) {
         val tr = translator ?: return finishWork()
         val blocks = result.textBlocks.filter { it.boundingBox != null && it.text.isNotBlank() }
         if (blocks.isEmpty()) {
@@ -658,6 +686,7 @@ class CaptureService : Service() {
         tr.downloadModelIfNeeded()
             .onSuccessTask { Tasks.whenAllSuccess<String>(blocks.map { tr.translate(blockText(it)) }) }
             .addOnSuccessListener { translations ->
+                if (id != job) return@addOnSuccessListener
                 val s = screenW.toFloat() / capW
                 val items = blocks.zip(translations).map { (b, t) ->
                     val r = b.boundingBox!!
@@ -674,7 +703,7 @@ class CaptureService : Service() {
                 finishWork()
             }
             .addOnFailureListener { e ->
-                finishWork("번역 실패 (앱에서 ② 모델 받기 먼저 해줘): ${e.message}")
+                if (id == job) finishWork("번역 실패 (앱에서 ② 모델 받기 먼저 해줘): ${e.message}")
             }
     }
 
@@ -700,7 +729,12 @@ class CaptureService : Service() {
                 layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             }
         }
-        wm.addView(view, p)
+        try {
+            wm.addView(view, p)
+        } catch (e: Exception) {
+            toast("번역 화면을 못 띄웠어: ${e.message}")
+            return
+        }
         overlay = view
         // 버튼을 번역 화면보다 위로 다시 올리기
         button?.let {

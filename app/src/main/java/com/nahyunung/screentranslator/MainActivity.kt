@@ -66,7 +66,7 @@ class MainActivity : Activity() {
             setTextColor(Color.BLACK)
         })
         root.addView(TextView(this).apply {
-            text = "다른 앱 위에 떠 있는 '번역' 버튼을 누르면 지금 화면의 글자를 한국어로 덮어씌워 줘. 번역 박스는 끌어서 옮길 수 있고, 빈 곳을 탭하면 닫혀. 버튼을 꾹 누르면 언어·엔진을 바꿀 수 있어."
+            text = "다른 앱 위에 떠 있는 '번역' 버튼을 누르면 지금 화면의 글자를 한국어로 덮어씌워 줘. 번역 박스는 끌어서 옮길 수 있고, 빈 곳을 탭하면 닫혀. 버튼을 꾹 누르면 언어·엔진을 바꿀 수 있고, 번역 중에 누르면 중지돼."
             textSize = 14f
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(8), 0, dp(24))

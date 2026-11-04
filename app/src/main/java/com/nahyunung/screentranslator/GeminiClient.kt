@@ -24,8 +24,38 @@ object GeminiClient {
         val retryable: Boolean = false,
         val code: Int = 0,
         val badThinkConfig: Boolean = false,
-        val blocked: Boolean = false
+        val blocked: Boolean = false,
+        val cancelled: Boolean = false
     ) : Exception(message)
+
+    /** 중지 버튼용: 진행 중인 연결을 끊어서 바로 멈춤 */
+    class CancelToken {
+        @Volatile var cancelled = false
+            private set
+        @Volatile internal var conn: HttpURLConnection? = null
+
+        fun cancel() {
+            cancelled = true
+            val c = conn ?: return
+            // 연결 끊기는 메인 스레드에서 하면 안 돼서 별도 스레드로
+            Thread { runCatching { c.disconnect() } }.start()
+        }
+
+        internal fun check() {
+            if (cancelled) throw GeminiException("중지됨", cancelled = true)
+        }
+
+        /** 중지되면 바로 깨는 sleep */
+        internal fun sleep(ms: Long) {
+            var left = ms
+            while (left > 0) {
+                check()
+                Thread.sleep(minOf(100L, left))
+                left -= 100
+            }
+            check()
+        }
+    }
 
     /** 필터 차단으로 답이 끊긴 경우의 finishReason 값들 */
     private val BLOCK_REASONS = setOf("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "IMAGE_SAFETY")
@@ -56,7 +86,7 @@ object GeminiClient {
     private enum class Think { LEVEL_MINIMAL, LEVEL_LOW, BUDGET_0, NONE }
 
     /** 모델별로 성공한 방식 기억 (앱 켜져 있는 동안) */
-    private val thinkCache = mutableMapOf<String, Think>()
+    private val thinkCache = java.util.concurrent.ConcurrentHashMap<String, Think>()
 
     private fun thinkOrder(model: String): List<Think> {
         thinkCache[model]?.let { return listOf(it) + Think.values().filter { t -> t != it } }
@@ -141,6 +171,7 @@ object GeminiClient {
         screenW: Int,
         screenH: Int,
         relaxedSafety: Boolean,
+        cancel: CancelToken = CancelToken(),
         onStatus: (String) -> Unit = {},
         onItem: (OverlayItem) -> Unit
     ): Int {
@@ -156,8 +187,9 @@ object GeminiClient {
             while (ti < order.size) {
                 val think = order[ti]
                 var delivered = 0
+                cancel.check()
                 try {
-                    stream(requestBody(jpeg, lang, think, relaxedSafety), m, apiKey, screenW, screenH) {
+                    stream(requestBody(jpeg, lang, think, relaxedSafety), m, apiKey, screenW, screenH, cancel) {
                         delivered++
                         onItem(it)
                     }
@@ -168,12 +200,13 @@ object GeminiClient {
                     if (delivered > 0) return delivered
                     lastError = e
                     when {
+                        e.cancelled -> throw e
                         e.blocked -> throw e // 필터 차단은 다른 모델도 똑같이 막힘
                         e.badThinkConfig -> ti++ // 이 모델이 그 thinking 설정을 모름 → 다음 방식
                         e.code == 503 && !busyRetried -> { // 붐빔은 같은 모델로 한 번만 더
                             busyRetried = true
                             onStatus("재시도")
-                            Thread.sleep(1500)
+                            cancel.sleep(1500)
                         }
                         e.retryable -> break // 다음 모델로
                         else -> throw e
@@ -191,6 +224,7 @@ object GeminiClient {
         apiKey: String,
         screenW: Int,
         screenH: Int,
+        cancel: CancelToken,
         onItem: (OverlayItem) -> Unit
     ) {
         val modelId = URLEncoder.encode(model, "UTF-8")
@@ -202,9 +236,13 @@ object GeminiClient {
             doOutput = true
             setRequestProperty("Content-Type", "application/json; charset=utf-8")
             setRequestProperty("x-goog-api-key", apiKey.trim())
+            // 업로드가 멈춰도 타임아웃이 걸리도록 길이를 미리 지정
+            setFixedLengthStreamingMode(body.toByteArray(Charsets.UTF_8).size)
         }
+        cancel.conn = conn
 
         try {
+            cancel.check()
             conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
             if (code !in 200..299) {
@@ -217,6 +255,7 @@ object GeminiClient {
             var blockReason: String? = null
             conn.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
                 while (true) {
+                    cancel.check()
                     val line = reader.readLine() ?: break
                     if (!line.startsWith("data:")) continue
                     val json = line.substring(5).trim()
@@ -251,8 +290,14 @@ object GeminiClient {
             }
             if (!gotAnyText) throw GeminiException("응답이 비었어", retryable = true, code = -2)
         } catch (e: SocketTimeoutException) {
+            cancel.check()
             throw GeminiException("응답이 너무 느려 (30초 초과)", retryable = true, code = -1)
+        } catch (e: java.io.IOException) {
+            // 중지 버튼으로 연결을 끊은 경우
+            cancel.check()
+            throw GeminiException("연결이 끊겼어 (인터넷 확인): ${e.message}", retryable = true, code = -3)
         } finally {
+            cancel.conn = null
             conn.disconnect()
         }
     }
