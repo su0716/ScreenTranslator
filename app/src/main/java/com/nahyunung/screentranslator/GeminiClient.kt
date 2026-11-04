@@ -23,8 +23,12 @@ object GeminiClient {
         message: String,
         val retryable: Boolean = false,
         val code: Int = 0,
-        val badThinkConfig: Boolean = false
+        val badThinkConfig: Boolean = false,
+        val blocked: Boolean = false
     ) : Exception(message)
+
+    /** 필터 차단으로 답이 끊긴 경우의 finishReason 값들 */
+    private val BLOCK_REASONS = setOf("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "IMAGE_SAFETY")
 
     /** 붐비거나 느릴 때 차례로 시도할 예비 모델 (빠른 순) */
     private val FALLBACK_MODELS = listOf("gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-2.5-flash")
@@ -60,7 +64,20 @@ object GeminiClient {
         else listOf(Think.LEVEL_MINIMAL, Think.LEVEL_LOW, Think.BUDGET_0, Think.NONE)
     }
 
-    private fun requestBody(jpegBase64: String, lang: SourceLang, think: Think): String {
+    /** 필터 완화 시 기본 4개 분류를 차단 안 함 (구글의 핵심 차단은 그대로 유지됨) */
+    private fun safetySettings(relaxed: Boolean): JSONArray? {
+        if (!relaxed) return null
+        val arr = JSONArray()
+        listOf(
+            "HARM_CATEGORY_HARASSMENT",
+            "HARM_CATEGORY_HATE_SPEECH",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            "HARM_CATEGORY_DANGEROUS_CONTENT"
+        ).forEach { arr.put(JSONObject().put("category", it).put("threshold", "BLOCK_NONE")) }
+        return arr
+    }
+
+    private fun requestBody(jpegBase64: String, lang: SourceLang, think: Think, relaxed: Boolean): String {
         val itemSchema = JSONObject()
             .put("type", "OBJECT")
             .put("properties", JSONObject()
@@ -80,7 +97,9 @@ object GeminiClient {
             Think.NONE -> Unit
         }
 
-        return JSONObject()
+        val root = JSONObject()
+        safetySettings(relaxed)?.let { root.put("safetySettings", it) }
+        return root
             .put("contents", JSONArray().put(JSONObject()
                 .put("role", "user")
                 .put("parts", JSONArray()
@@ -121,6 +140,7 @@ object GeminiClient {
         model: String,
         screenW: Int,
         screenH: Int,
+        relaxedSafety: Boolean,
         onStatus: (String) -> Unit = {},
         onItem: (OverlayItem) -> Unit
     ): Int {
@@ -137,7 +157,7 @@ object GeminiClient {
                 val think = order[ti]
                 var delivered = 0
                 try {
-                    stream(requestBody(jpeg, lang, think), m, apiKey, screenW, screenH) {
+                    stream(requestBody(jpeg, lang, think, relaxedSafety), m, apiKey, screenW, screenH) {
                         delivered++
                         onItem(it)
                     }
@@ -148,6 +168,7 @@ object GeminiClient {
                     if (delivered > 0) return delivered
                     lastError = e
                     when {
+                        e.blocked -> throw e // 필터 차단은 다른 모델도 똑같이 막힘
                         e.badThinkConfig -> ti++ // 이 모델이 그 thinking 설정을 모름 → 다음 방식
                         e.code == 503 && !busyRetried -> { // 붐빔은 같은 모델로 한 번만 더
                             busyRetried = true
@@ -193,6 +214,7 @@ object GeminiClient {
 
             val extractor = JsonArrayStreamer { obj -> toItem(obj, screenW, screenH)?.let(onItem) }
             var gotAnyText = false
+            var blockReason: String? = null
             conn.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
                 while (true) {
                     val line = reader.readLine() ?: break
@@ -203,8 +225,11 @@ object GeminiClient {
                     root.optJSONObject("error")?.let {
                         throw httpError(it.optInt("code", 500), json, model)
                     }
-                    val parts = root.optJSONArray("candidates")?.optJSONObject(0)
-                        ?.optJSONObject("content")?.optJSONArray("parts") ?: continue
+                    root.optJSONObject("promptFeedback")?.optString("blockReason")
+                        ?.takeIf { it.isNotEmpty() }?.let { blockReason = it }
+                    val cand = root.optJSONArray("candidates")?.optJSONObject(0)
+                    cand?.optString("finishReason")?.takeIf { it in BLOCK_REASONS }?.let { blockReason = it }
+                    val parts = cand?.optJSONObject("content")?.optJSONArray("parts") ?: continue
                     for (i in 0 until parts.length()) {
                         val p = parts.getJSONObject(i)
                         if (p.optBoolean("thought")) continue
@@ -215,6 +240,14 @@ object GeminiClient {
                         }
                     }
                 }
+            }
+            blockReason?.let { r ->
+                // 일부 박스는 이미 나갔을 수도 있음 → 호출한 쪽에서 delivered로 처리
+                throw GeminiException(
+                    "AI 안전 필터에 걸려서 번역 못 함 ($r)" +
+                        if (r == "SAFETY") " — 앱 설정의 '필터 완화'를 켜봐" else "",
+                    blocked = true
+                )
             }
             if (!gotAnyText) throw GeminiException("응답이 비었어", retryable = true, code = -2)
         } catch (e: SocketTimeoutException) {

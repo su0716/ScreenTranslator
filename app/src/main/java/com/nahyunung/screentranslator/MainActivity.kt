@@ -14,6 +14,7 @@ import android.provider.Settings
 import android.view.Gravity
 import android.text.InputType
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.RadioButton
@@ -125,6 +126,12 @@ class MainActivity : Activity() {
             setText(Prefs.model(this@MainActivity))
         }
         root.addView(modelInput)
+        root.addView(CheckBox(this).apply {
+            text = "필터 완화 (게임 채팅 욕설 등도 번역)"
+            textSize = 15f
+            isChecked = Prefs.relaxedSafety(this@MainActivity)
+            setOnCheckedChangeListener { _, v -> Prefs.setRelaxedSafety(this@MainActivity, v) }
+        })
         root.addView(bigButton("키·모델 저장") {
             Prefs.setApiKey(this, keyInput.text.toString())
             Prefs.setModel(this, modelInput.text.toString().ifBlank { Prefs.DEFAULT_MODEL })

@@ -603,6 +603,7 @@ class CaptureService : Service() {
         val l = lang
         val w = screenW
         val h = screenH
+        val relaxed = Prefs.relaxedSafety(this)
         val session = ++aiSession
         aiClosedByUser = false
         val started = System.currentTimeMillis()
@@ -611,6 +612,7 @@ class CaptureService : Service() {
             val result = runCatching {
                 GeminiClient.translate(
                     bmp, l, key, model, w, h,
+                    relaxedSafety = relaxed,
                     onStatus = { msg -> main.post { if (session == aiSession) setButtonState(msg) } },
                     onItem = { item ->
                         main.post {

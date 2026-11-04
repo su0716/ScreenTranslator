@@ -66,6 +66,10 @@ object Prefs {
         sp(ctx).getString(KEY_MODEL, DEFAULT_MODEL)?.takeIf { it.isNotBlank() } ?: DEFAULT_MODEL
     fun setModel(ctx: Context, m: String) = sp(ctx).edit().putString(KEY_MODEL, m.trim()).apply()
 
+    /** AI 안전 필터 완화 (게임 채팅 욕설 등도 번역) */
+    fun relaxedSafety(ctx: Context): Boolean = sp(ctx).getBoolean("relaxed_safety", true)
+    fun setRelaxedSafety(ctx: Context, v: Boolean) = sp(ctx).edit().putBoolean("relaxed_safety", v).apply()
+
     /** 번역 끝나면 걸린 시간 표시 (속도 확인용) */
     fun showTiming(ctx: Context): Boolean = sp(ctx).getBoolean("show_timing", true)
 
