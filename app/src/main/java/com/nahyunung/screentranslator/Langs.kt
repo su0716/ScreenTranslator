@@ -1,6 +1,7 @@
 package com.nahyunung.screentranslator
 
 import android.content.Context
+import android.graphics.Rect
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
@@ -38,9 +39,12 @@ enum class SourceLang(
 }
 
 /** 번역 엔진 */
-enum class Engine(val label: String, val short: String) {
-    GEMINI("AI (제미나이)", "AI"),
-    MLKIT("오프라인 (ML Kit)", "오프");
+enum class Engine(val label: String, val short: String, val usesGemini: Boolean) {
+    GEMINI("AI 정밀", "AI", true),      // 이미지째 보냄: 세로쓰기 OK, 느림
+    HYBRID("AI 빠름", "빠름", true),     // 폰에서 글자 찾고 글자만 보냄: 빠름, 세로쓰기 약함
+    MLKIT("오프라인", "오프", false);    // 전부 폰에서: 인터넷 X, 품질 낮음
+
+    fun next(): Engine = values()[(ordinal + 1) % values().size]
 }
 
 object Prefs {
@@ -66,6 +70,17 @@ object Prefs {
         sp(ctx).getString(KEY_MODEL, DEFAULT_MODEL)?.takeIf { it.isNotBlank() } ?: DEFAULT_MODEL
     fun setModel(ctx: Context, m: String) = sp(ctx).edit().putString(KEY_MODEL, m.trim()).apply()
 
+    /** 영역 선택 모드: 버튼 탭 → 영역 드래그 → 버튼 다시 탭하면 전송 */
+    fun regionMode(ctx: Context): Boolean = sp(ctx).getBoolean("region_mode", false)
+    fun setRegionMode(ctx: Context, v: Boolean) = sp(ctx).edit().putBoolean("region_mode", v).apply()
+
+    /** 마지막으로 고른 영역 (다음에 그대로 다시 쓰기 좋게) */
+    fun lastRegion(ctx: Context): Rect? = sp(ctx).getString("last_region", null)
+        ?.split(",")?.mapNotNull { it.toIntOrNull() }?.takeIf { it.size == 4 }
+        ?.let { Rect(it[0], it[1], it[2], it[3]) }
+    fun setLastRegion(ctx: Context, r: Rect) =
+        sp(ctx).edit().putString("last_region", "${r.left},${r.top},${r.right},${r.bottom}").apply()
+
     /** AI 안전 필터 완화 (게임 채팅 욕설 등도 번역) */
     fun relaxedSafety(ctx: Context): Boolean = sp(ctx).getBoolean("relaxed_safety", true)
     fun setRelaxedSafety(ctx: Context, v: Boolean) = sp(ctx).edit().putBoolean("relaxed_safety", v).apply()
@@ -81,4 +96,16 @@ object Prefs {
     fun setSource(ctx: Context, lang: SourceLang) {
         ctx.getSharedPreferences(FILE, Context.MODE_PRIVATE).edit().putString(KEY_SRC, lang.name).apply()
     }
+}
+
+/** 한 번 번역한 문장은 기억해 뒀다가 즉시 재사용 (게임 UI처럼 반복되는 글). 메인 스레드 전용. */
+object TranslationCache {
+    private const val MAX = 800
+    private val map = object : LinkedHashMap<String, String>(256, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?) = size > MAX
+    }
+
+    private fun key(lang: SourceLang, text: String) = "${lang.name}|${text.trim()}"
+    fun get(lang: SourceLang, text: String): String? = map[key(lang, text)]
+    fun put(lang: SourceLang, text: String, ko: String) { map[key(lang, text)] = ko }
 }

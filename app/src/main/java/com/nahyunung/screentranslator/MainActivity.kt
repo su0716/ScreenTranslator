@@ -35,6 +35,7 @@ class MainActivity : Activity() {
     private lateinit var modelBtn: Button
     private lateinit var langGroup: RadioGroup
     private lateinit var engineGroup: RadioGroup
+    private var regionCheck: CheckBox? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -46,6 +47,7 @@ class MainActivity : Activity() {
         // 떠 있는 버튼에서 언어를 바꿨을 수도 있으니 다시 반영
         if (::langGroup.isInitialized) langGroup.check(1000 + Prefs.source(this).ordinal)
         if (::engineGroup.isInitialized) engineGroup.check(2000 + Prefs.engine(this).ordinal)
+        regionCheck?.isChecked = Prefs.regionMode(this)
         refreshStatus()
     }
 
@@ -66,7 +68,7 @@ class MainActivity : Activity() {
             setTextColor(Color.BLACK)
         })
         root.addView(TextView(this).apply {
-            text = "다른 앱 위에 떠 있는 '번역' 버튼을 누르면 지금 화면의 글자를 한국어로 덮어씌워 줘. 번역 박스는 끌어서 옮길 수 있고, 빈 곳을 탭하면 닫혀. 버튼을 꾹 누르면 언어·엔진을 바꿀 수 있고, 번역 중에 누르면 중지돼."
+            text = "다른 앱 위에 떠 있는 '번역' 버튼을 누르면 지금 화면의 글자를 한국어로 덮어씌워 줘. 번역 박스는 끌어서 옮길 수 있고, 빈 곳을 탭하면 닫혀. 버튼을 꾹 누르면 언어·엔진·영역 선택을 바꿀 수 있고, 번역 중에 누르면 중지돼."
             textSize = 14f
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(8), 0, dp(24))
@@ -98,8 +100,11 @@ class MainActivity : Activity() {
         Engine.values().forEachIndexed { i, e ->
             engineGroup.addView(RadioButton(this).apply {
                 id = 2000 + i
-                text = if (e == Engine.GEMINI) "AI (제미나이) — 고품질, 세로글씨 OK, 인터넷 필요"
-                       else "오프라인 (ML Kit) — 빠름, 품질 낮음"
+                text = when (e) {
+                    Engine.GEMINI -> "AI 정밀 — 이미지째 보냄, 세로글씨·말풍선 OK"
+                    Engine.HYBRID -> "AI 빠름 — 글자만 보냄, 가로글씨용, 반복 문장 즉시"
+                    Engine.MLKIT -> "오프라인 — 인터넷 없이, 품질 낮음"
+                }
                 textSize = 15f
                 isChecked = e == curEngine
             })
@@ -126,6 +131,13 @@ class MainActivity : Activity() {
             setText(Prefs.model(this@MainActivity))
         }
         root.addView(modelInput)
+        root.addView(CheckBox(this).apply {
+            text = "영역 선택 (버튼 → 영역 드래그 → 버튼 다시 누르기)"
+            textSize = 15f
+            isChecked = Prefs.regionMode(this@MainActivity)
+            setOnCheckedChangeListener { _, v -> Prefs.setRegionMode(this@MainActivity, v) }
+            regionCheck = this
+        })
         root.addView(CheckBox(this).apply {
             text = "필터 완화 (게임 채팅 욕설 등도 번역)"
             textSize = 15f
@@ -196,7 +208,7 @@ class MainActivity : Activity() {
         val engine = Prefs.engine(this)
         val key = if (Prefs.apiKey(this).isBlank()) "❌ 없음" else "✅ 저장됨"
         status.text = "표시 권한: $overlay\n번역 버튼: $running\n원문 언어: ${Prefs.source(this).label} → 한국어\n" +
-            "엔진: ${engine.label}" + (if (engine == Engine.GEMINI) "\nAPI 키: $key" else "")
+            "엔진: ${engine.label}" + (if (engine.usesGemini) "\nAPI 키: $key" else "")
     }
 
     // ---------- 권한 / 모델 ----------

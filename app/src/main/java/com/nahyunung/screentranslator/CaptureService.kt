@@ -154,6 +154,7 @@ class CaptureService : Service() {
         cancelToken?.cancel()
         main.removeCallbacks(watchdog)
         hideLangMenu()
+        removeRegionSelect()
         removeOverlay()
         button?.let { runCatching { wm.removeView(it) } }
         button = null
@@ -318,7 +319,9 @@ class CaptureService : Service() {
 
     private fun buttonLabel(): String {
         val e = Prefs.engine(this)
-        return if (e == Engine.GEMINI) "번역\nAI·${lang.short}" else "번역\n${lang.short}"
+        val top = if (Prefs.regionMode(this)) "번역▢" else "번역"
+        val bottom = if (e == Engine.MLKIT) lang.short else "${e.short}·${lang.short}"
+        return "$top\n$bottom"
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -406,15 +409,32 @@ class CaptureService : Service() {
         button?.visibility = if (visible) View.VISIBLE else View.INVISIBLE
     }
 
-    // ---------------- 언어 선택 메뉴 (버튼 길게 누르기) ----------------
+    // ---------------- 메뉴 (버튼 길게 누르기) ----------------
 
     private var langMenu: View? = null
+
+    private fun menuItem(label: String, selected: Boolean = false, small: Boolean = false, onClick: () -> Unit) =
+        TextView(this).apply {
+            text = label
+            textSize = if (small) 13f else 15f
+            gravity = Gravity.CENTER
+            setTextColor(if (small) Color.argb(230, 255, 255, 255) else Color.WHITE)
+            setPadding(0, dp(if (small) 8 else 10), 0, dp(if (small) 8 else 10))
+            if (selected) background = GradientDrawable().apply {
+                cornerRadius = dp(10).toFloat()
+                setColor(Color.parseColor("#2F6BFF"))
+            }
+            setOnClickListener {
+                hideLangMenu()
+                onClick()
+            }
+        }
 
     @SuppressLint("ClickableViewAccessibility")
     private fun showLangMenu() {
         hideLangMenu()
         val btnSize = dp(56)
-        val menuW = dp(104)
+        val menuW = dp(112)
         val menu = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(6), dp(6), dp(6), dp(6))
@@ -423,43 +443,30 @@ class CaptureService : Service() {
                 setColor(Color.argb(240, 30, 30, 34))
             }
         }
+        // 언어
         SourceLang.values().forEach { l ->
             val selected = l == lang
-            menu.addView(TextView(this).apply {
-                text = if (selected) "✓ ${l.label}" else l.label
-                textSize = 15f
-                gravity = Gravity.CENTER
-                setTextColor(Color.WHITE)
-                setPadding(0, dp(10), 0, dp(10))
-                if (selected) background = GradientDrawable().apply {
-                    cornerRadius = dp(10).toFloat()
-                    setColor(Color.parseColor("#2F6BFF"))
-                }
-                setOnClickListener {
-                    hideLangMenu()
-                    switchLang(l)
-                }
-            })
+            menu.addView(menuItem(if (selected) "✓ ${l.label}" else l.label, selected) { switchLang(l) })
         }
-        // 구분선 + 엔진 전환
+        // 구분선
         menu.addView(View(this).apply {
             setBackgroundColor(Color.argb(80, 255, 255, 255))
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)).apply {
                 topMargin = dp(4); bottomMargin = dp(4)
             }
         })
+        // 엔진 (누를 때마다 정밀 → 빠름 → 오프라인 순환)
         val engine = Prefs.engine(this)
-        menu.addView(TextView(this).apply {
-            text = if (engine == Engine.GEMINI) "엔진: AI ⇄" else "엔진: 오프 ⇄"
-            textSize = 13f
-            gravity = Gravity.CENTER
-            setTextColor(Color.argb(220, 255, 255, 255))
-            setPadding(0, dp(8), 0, dp(8))
-            setOnClickListener {
-                hideLangMenu()
-                switchEngine(if (engine == Engine.GEMINI) Engine.MLKIT else Engine.GEMINI)
-            }
+        menu.addView(menuItem("엔진: ${engine.short} ⇄", small = true) { switchEngine(engine.next()) })
+        // 영역 선택 ON/OFF
+        val region = Prefs.regionMode(this)
+        menu.addView(menuItem(if (region) "영역 선택: ON" else "영역 선택: OFF", small = true) {
+            Prefs.setRegionMode(this, !region)
+            removeRegionSelect()
+            setButtonState(buttonLabel())
+            toast(if (!region) "영역 선택 ON — 버튼 누르고 영역 드래그 → 버튼 다시 누르기" else "영역 선택 OFF — 화면 전체 번역")
         })
+
         // 버튼이 화면 오른쪽에 있으면 메뉴는 왼쪽, 아니면 오른쪽에
         val onRight = buttonParams.x + btnSize / 2 > screenW / 2
         val p = WindowManager.LayoutParams(
@@ -505,8 +512,8 @@ class CaptureService : Service() {
         val tr = l.translator()
         translator = tr
         setButtonState(buttonLabel())
-        if (Prefs.engine(this) == Engine.GEMINI) {
-            toast("${l.label} → 한국어 (AI)")
+        if (Prefs.engine(this).usesGemini) {
+            toast("${l.label} → 한국어")
             return
         }
         // 오프라인 모드: 번역 모델이 없으면 미리 받아두기
@@ -529,9 +536,9 @@ class CaptureService : Service() {
         Prefs.setEngine(this, e)
         removeOverlay()
         setButtonState(buttonLabel())
-        if (e == Engine.GEMINI) {
+        if (e.usesGemini) {
             if (Prefs.apiKey(this).isBlank()) toast("앱 설정에 제미나이 API 키를 넣어줘")
-            else toast("AI 번역 모드")
+            else toast(if (e == Engine.GEMINI) "AI 정밀 (세로글씨 OK)" else "AI 빠름 (가로글씨용)")
             return
         }
         val tr = translator ?: return
@@ -544,6 +551,29 @@ class CaptureService : Service() {
                 busy = false
                 setButtonState(buttonLabel())
             }
+    }
+
+    // ---------------- 영역 선택 ----------------
+
+    private var regionView: RegionSelectView? = null
+
+    private fun showRegionSelect() {
+        removeRegionSelect()
+        val v = RegionSelectView(this, Prefs.lastRegion(this)) {
+            removeRegionSelect()
+            setButtonState(buttonLabel())
+        }
+        if (!addFullScreenView(v)) return
+        regionView = v
+        raiseButton()
+        setButtonState("영역\n▶보내기")
+        // 영역 고르는 동안 서버 연결 미리 열어두기
+        warmUpIfAi()
+    }
+
+    private fun removeRegionSelect() {
+        regionView?.let { runCatching { wm.removeView(it) } }
+        regionView = null
     }
 
     // ---------------- 번역 ----------------
@@ -563,6 +593,12 @@ class CaptureService : Service() {
         finishWork(msg)
     }
 
+    private fun warmUpIfAi() {
+        if (!Prefs.engine(this).usesGemini) return
+        val key = Prefs.apiKey(this).takeIf { it.isNotBlank() } ?: return
+        net.execute { GeminiClient.warmUp(key) }
+    }
+
     private fun onButtonTap() {
         if (busy) { // 번역 중에 누르면 중지
             cancelWork("중지했어")
@@ -580,17 +616,37 @@ class CaptureService : Service() {
             recognizer = pref.recognizer()
             translator = pref.translator()
         }
-        if (Prefs.engine(this) == Engine.GEMINI && Prefs.apiKey(this).isBlank()) {
+        if (Prefs.engine(this).usesGemini && Prefs.apiKey(this).isBlank()) {
             toast("앱 설정에 제미나이 API 키를 넣어줘")
             return
         }
+
+        // 영역 선택 모드: 첫 탭 = 영역 고르기 화면, 두 번째 탭 = 그 영역 보내기
+        var region: Rect? = null
+        if (Prefs.regionMode(this)) {
+            val rv = regionView
+            if (rv == null) {
+                showRegionSelect()
+                return
+            }
+            region = rv.selectedRect()
+            if (region == null) {
+                toast("번역할 부분을 먼저 드래그해줘")
+                return
+            }
+            Prefs.setLastRegion(this, region)
+            removeRegionSelect()
+        } else {
+            warmUpIfAi()
+        }
+
         busy = true
         val id = ++job
         main.removeCallbacks(watchdog)
         main.postDelayed(watchdog, 60_000)
-        // 버튼이 캡처에 찍히지 않게 잠깐 숨기고, 새 프레임이 올 때까지 대기
+        // 버튼(과 영역 선택 화면)이 캡처에 찍히지 않게 잠깐 숨기고, 새 프레임이 올 때까지 대기
         setButtonState(buttonLabel(), visible = false)
-        main.postDelayed({ captureAndTranslate(id) }, 300)
+        main.postDelayed({ captureAndTranslate(id, region) }, 150)
     }
 
     private fun finishWork(error: String? = null) {
@@ -601,34 +657,105 @@ class CaptureService : Service() {
         if (error != null) toast(error)
     }
 
-    private fun captureAndTranslate(id: Int) {
+    /**
+     * @param region 번역할 화면 영역 (null이면 전체 화면)
+     */
+    private fun captureAndTranslate(id: Int, region: Rect?) {
         if (id != job) return // 그새 중지됨
-        val bmp = grabBitmap()
+        val full = grabBitmap()
         busyLabel("…")
-        if (bmp == null) {
+        if (full == null) {
             finishWork("화면을 못 가져왔어. 다시 눌러봐")
             return
         }
-        if (Prefs.engine(this) == Engine.GEMINI) {
-            translateWithGemini(bmp, id)
+        // 이미지가 화면에서 차지하는 영역 (결과 박스를 화면 좌표로 바꿀 때 기준)
+        val screenRect = Rect(0, 0, screenW, screenH)
+        val target = region?.let { Rect(it).apply { if (!intersect(screenRect)) setEmpty() } } ?: screenRect
+        if (target.isEmpty) {
+            full.recycle()
+            finishWork("영역이 화면 밖이야. 다시 골라줘")
             return
         }
-        val rec = recognizer ?: return finishWork()
+        val bmp = if (region == null) full else {
+            // 화면 좌표 → 캡처 이미지 좌표로 바꿔서 잘라내기
+            val s = full.width.toFloat() / screenW
+            val l = (target.left * s).toInt().coerceIn(0, full.width - 1)
+            val t = (target.top * s).toInt().coerceIn(0, full.height - 1)
+            val w = (target.width() * s).toInt().coerceIn(1, full.width - l)
+            val h = (target.height() * s).toInt().coerceIn(1, full.height - t)
+            Bitmap.createBitmap(full, l, t, w, h).also { if (it !== full) full.recycle() }
+        }
+
+        when (Prefs.engine(this)) {
+            Engine.GEMINI -> translateWithGemini(bmp, target, id)
+            Engine.HYBRID -> recognizeThen(bmp, id) { blocks -> translateHybrid(blocks, bmp, target, id) }
+            Engine.MLKIT -> recognizeThen(bmp, id) { blocks -> translateOffline(blocks, bmp, target, id) }
+        }
+    }
+
+    /** 폰 안에서 글자 찾기(ML Kit OCR) → 결과 블록 넘겨줌 */
+    private fun recognizeThen(bmp: Bitmap, id: Int, next: (List<Text.TextBlock>) -> Unit) {
+        val rec = recognizer ?: run { bmp.recycle(); return finishWork() }
         rec.process(InputImage.fromBitmap(bmp, 0))
-            .addOnSuccessListener { result -> if (id == job) translateBlocks(result, id) }
+            .addOnSuccessListener { result ->
+                if (id != job) return@addOnSuccessListener
+                val blocks = result.textBlocks.filter { it.boundingBox != null && it.text.isNotBlank() }
+                if (blocks.isEmpty()) finishWork("${lang.label} 글자를 못 찾았어")
+                else next(blocks)
+            }
             .addOnFailureListener { e -> if (id == job) finishWork("글자 인식 실패: ${e.message}") }
             .addOnCompleteListener { bmp.recycle() }
     }
 
+    /** OCR 블록 좌표(잘라낸 이미지 기준) → 화면 좌표 */
+    private fun blockRect(b: Text.TextBlock, bmp: Bitmap, target: Rect): Rect {
+        val r = b.boundingBox!!
+        val sx = target.width().toFloat() / bmp.width
+        val sy = target.height().toFloat() / bmp.height
+        return Rect(
+            target.left + (r.left * sx).toInt(), target.top + (r.top * sy).toInt(),
+            target.left + (r.right * sx).toInt(), target.top + (r.bottom * sy).toInt()
+        )
+    }
+
+    private fun blockText(b: Text.TextBlock): String =
+        b.lines.joinToString(if (lang.joinWithSpace) " " else "") { it.text }
+
     /** 스트리밍 중에 사용자가 번역 화면을 닫았는지 (닫았으면 남은 박스 무시) */
     private var aiClosedByUser = false
 
-    private fun translateWithGemini(bmp: Bitmap, session: Int) {
+    /** 결과 박스 하나 화면에 추가 (첫 박스면 번역 화면 띄움) */
+    private fun deliver(item: OverlayItem, session: Int) {
+        if (session != job || aiClosedByUser) return
+        val ov = overlay
+        if (ov == null) showOverlay(listOf(item)) else ov.addItem(item)
+    }
+
+    private fun finishAi(session: Int, started: Long, result: Result<Int>, cachedCount: Int = 0) {
+        if (session != job) return
+        result.onSuccess { count ->
+            val total = count + cachedCount
+            if (total == 0) finishWork("번역할 외국어를 못 찾았어")
+            else {
+                val sec = (System.currentTimeMillis() - started) / 100 / 10.0
+                finishWork()
+                if (Prefs.showTiming(this)) {
+                    toast(if (cachedCount > 0) "${total}개 (저장된 ${cachedCount}개) · ${sec}초" else "${total}개 · ${sec}초")
+                }
+            }
+        }.onFailure { e ->
+            finishWork(
+                if (e is GeminiClient.GeminiException) e.message
+                else "AI 번역 실패 (인터넷 확인): ${e.message}"
+            )
+        }
+    }
+
+    /** [AI 정밀] 이미지째 보내기 */
+    private fun translateWithGemini(bmp: Bitmap, target: Rect, session: Int) {
         val key = Prefs.apiKey(this)
         val model = Prefs.model(this)
         val l = lang
-        val w = screenW
-        val h = screenH
         val relaxed = Prefs.relaxedSafety(this)
         aiClosedByUser = false
         val started = System.currentTimeMillis()
@@ -637,67 +764,80 @@ class CaptureService : Service() {
         busyLabel("AI…")
         net.execute {
             val result = runCatching {
-                GeminiClient.translate(
-                    bmp, l, key, model, w, h,
+                GeminiClient.translateImage(
+                    bmp, l, key, model, target,
                     relaxedSafety = relaxed,
                     cancel = token,
                     onStatus = { msg -> main.post { if (session == job) busyLabel(msg) } },
-                    onItem = { item ->
+                    onItem = { item -> main.post { deliver(item, session) } }
+                )
+            }
+            bmp.recycle()
+            main.post { finishAi(session, started, result) }
+        }
+    }
+
+    /** [AI 빠름] 폰에서 찾은 글자만 보내기 + 번역 저장해서 재사용 */
+    private fun translateHybrid(blocks: List<Text.TextBlock>, bmp: Bitmap, target: Rect, session: Int) {
+        val started = System.currentTimeMillis()
+        aiClosedByUser = false
+        val l = lang
+        val entries = blocks.map { b ->
+            Triple(blockRect(b, bmp, target), blockText(b), b.lines.size.coerceAtLeast(1))
+        }
+        // 전에 번역한 문장은 바로 표시
+        val todo = mutableListOf<Triple<Rect, String, Int>>()
+        var cached = 0
+        for (e in entries) {
+            val hit = TranslationCache.get(l, e.second)
+            if (hit != null) {
+                deliver(OverlayItem(e.first, hit, e.third), session)
+                cached++
+            } else todo += e
+        }
+        if (todo.isEmpty()) {
+            finishAi(session, started, Result.success(0), cached)
+            return
+        }
+
+        val key = Prefs.apiKey(this)
+        val model = Prefs.model(this)
+        val relaxed = Prefs.relaxedSafety(this)
+        val token = GeminiClient.CancelToken()
+        cancelToken = token
+        busyLabel("AI…")
+        val texts = todo.map { it.second }
+        net.execute {
+            val result = runCatching {
+                GeminiClient.translateTexts(
+                    texts, l, key, model,
+                    relaxedSafety = relaxed,
+                    cancel = token,
+                    onStatus = { msg -> main.post { if (session == job) busyLabel(msg) } },
+                    onTranslated = { i, ko ->
                         main.post {
-                            if (session != job || aiClosedByUser) return@post
-                            // 첫 박스면 오버레이 띄우고, 이후엔 하나씩 추가
-                            val ov = overlay
-                            if (ov == null) showOverlay(listOf(item)) else ov.addItem(item)
+                            TranslationCache.put(l, texts[i], ko)
+                            val e = todo[i]
+                            deliver(OverlayItem(e.first, ko, e.third), session)
                         }
                     }
                 )
             }
-            bmp.recycle()
-            main.post {
-                if (session != job) return@post
-                result.onSuccess { count ->
-                    if (count == 0) finishWork("번역할 외국어를 못 찾았어")
-                    else {
-                        val sec = (System.currentTimeMillis() - started) / 100 / 10.0
-                        finishWork()
-                        if (Prefs.showTiming(this)) toast("${count}개 · ${sec}초")
-                    }
-                }.onFailure { e ->
-                    finishWork(
-                        if (e is GeminiClient.GeminiException) e.message
-                        else "AI 번역 실패 (인터넷 확인): ${e.message}"
-                    )
-                }
-            }
+            main.post { finishAi(session, started, result, cached) }
         }
     }
 
-    private fun blockText(b: Text.TextBlock): String =
-        b.lines.joinToString(if (lang.joinWithSpace) " " else "") { it.text }
-
-    private fun translateBlocks(result: Text, id: Int) {
+    /** [오프라인] ML Kit 번역 */
+    private fun translateOffline(blocks: List<Text.TextBlock>, bmp: Bitmap, target: Rect, id: Int) {
         val tr = translator ?: return finishWork()
-        val blocks = result.textBlocks.filter { it.boundingBox != null && it.text.isNotBlank() }
-        if (blocks.isEmpty()) {
-            finishWork("${lang.label} 글자를 못 찾았어")
-            return
-        }
+        val rects = blocks.map { blockRect(it, bmp, target) }
         // 모델이 없으면 여기서 받음(인터넷 필요), 있으면 바로 통과
         tr.downloadModelIfNeeded()
             .onSuccessTask { Tasks.whenAllSuccess<String>(blocks.map { tr.translate(blockText(it)) }) }
             .addOnSuccessListener { translations ->
                 if (id != job) return@addOnSuccessListener
-                val s = screenW.toFloat() / capW
-                val items = blocks.zip(translations).map { (b, t) ->
-                    val r = b.boundingBox!!
-                    OverlayItem(
-                        rect = Rect(
-                            (r.left * s).toInt(), (r.top * s).toInt(),
-                            (r.right * s).toInt(), (r.bottom * s).toInt()
-                        ),
-                        text = t,
-                        lineCount = b.lines.size.coerceAtLeast(1)
-                    )
+                val items = blocks.indices.map { i ->
+                    OverlayItem(rects[i], translations[i], blocks[i].lines.size.coerceAtLeast(1))
                 }
                 showOverlay(items)
                 finishWork()
@@ -707,12 +847,8 @@ class CaptureService : Service() {
             }
     }
 
-    private fun showOverlay(items: List<OverlayItem>) {
-        removeOverlay()
-        val view = TranslateOverlayView(this, items) {
-            aiClosedByUser = true // 스트리밍 중에 닫았으면 남은 박스는 안 띄움
-            removeOverlay()
-        }
+    /** 화면 전체를 덮는 창 추가. 실패하면 false */
+    private fun addFullScreenView(v: View): Boolean {
         val p = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -729,20 +865,34 @@ class CaptureService : Service() {
                 layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             }
         }
-        try {
-            wm.addView(view, p)
+        return try {
+            wm.addView(v, p)
+            true
         } catch (e: Exception) {
-            toast("번역 화면을 못 띄웠어: ${e.message}")
-            return
+            toast("화면을 못 띄웠어: ${e.message}")
+            false
         }
-        overlay = view
-        // 버튼을 번역 화면보다 위로 다시 올리기
+    }
+
+    /** 떠 있는 버튼을 다른 창들보다 위로 다시 올리기 */
+    private fun raiseButton() {
         button?.let {
             runCatching {
                 wm.removeView(it)
                 wm.addView(it, buttonParams)
             }
         }
+    }
+
+    private fun showOverlay(items: List<OverlayItem>) {
+        removeOverlay()
+        val view = TranslateOverlayView(this, items) {
+            aiClosedByUser = true // 스트리밍 중에 닫았으면 남은 박스는 안 띄움
+            removeOverlay()
+        }
+        if (!addFullScreenView(view)) return
+        overlay = view
+        raiseButton()
     }
 
     private fun removeOverlay() {
