@@ -48,6 +48,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -895,12 +896,14 @@ class CaptureService : Service() {
             }
             if (session != job) return@launch
             val err = result.exceptionOrNull()
-            if (err is CancellationException) return@launch
+            // 중지 버튼으로 취소된 거면 끝 (시간 초과는 아래에서 대체 번역)
+            if (err is CancellationException && err !is TimeoutCancellationException) return@launch
             // 하나도 못 받았고 제미나이 키가 있으면 AI 빠름으로 대신 번역
             if (err != null && delivered == 0 && Prefs.apiKey(this@CaptureService).isNotBlank()) {
                 val why = when {
                     NanoClient.isBackgroundBlocked(err) -> "나노 막힘(앞 화면 아님)"
-                    else -> "나노 실패"
+                    err is TimeoutCancellationException -> "나노 시간 초과"
+                    else -> "나노 실패(${NanoClient.describe(err).take(60)})"
                 }
                 sendTextsToGemini(todo, session, started, cached, note = "$why → AI 빠름으로 번역")
                 return@launch
@@ -911,7 +914,8 @@ class CaptureService : Service() {
                     if (delivered > 0) delivered
                     else throw Exception(
                         if (NanoClient.isBackgroundBlocked(it)) "나노가 막혔어 (앱이 앞 화면이 아니래)"
-                        else "나노 번역 실패: ${it.message}"
+                        else if (it is TimeoutCancellationException) "나노가 25초 넘게 응답 없음"
+                        else "나노 번역 실패: ${NanoClient.describe(it)}"
                     )
                 },
                 cached, note = "나노"

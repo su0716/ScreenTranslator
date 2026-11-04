@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
+import android.view.View
 import android.text.InputType
 import android.widget.Button
 import android.widget.CheckBox
@@ -26,6 +27,8 @@ import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.genai.common.DownloadStatus
 import com.google.mlkit.genai.common.FeatureStatus
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -165,8 +168,17 @@ class MainActivity : Activity() {
         root.addView(bigButton("① 다른 앱 위에 표시 권한 켜기") { openOverlaySettings() })
         modelBtn = bigButton("② 오프라인 번역 모델 받기 (오프라인 엔진용)") { downloadModel() }
         root.addView(modelBtn)
-        nanoBtn = bigButton("③ 나노 모델 확인·받기 (나노 엔진용, 실험)") { checkNano() }
+        nanoBtn = bigButton("③ 나노 진단·받기 (나노 엔진용, 실험)") { checkNano() }
         root.addView(nanoBtn)
+        nanoLog = TextView(this).apply {
+            textSize = 12f
+            setTextColor(Color.DKGRAY)
+            setBackgroundColor(Color.rgb(245, 245, 247))
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            visibility = View.GONE
+            setTextIsSelectable(true)
+        }
+        root.addView(nanoLog)
 
         root.addView(label("실행").apply { setPadding(0, dp(24), 0, dp(8)) })
         root.addView(bigButton("▶ 번역 버튼 띄우기", primary = true) { start() })
@@ -240,69 +252,89 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
+    /** 나노 진단 로그 (어느 단계에서 멈추는지 보이게) */
+    private lateinit var nanoLog: TextView
+    private val nanoLines = mutableListOf<String>()
+    private var nanoStart = 0L
+
+    private fun log(msg: String) {
+        val sec = (System.currentTimeMillis() - nanoStart) / 100 / 10.0
+        nanoLines += "[${sec}초] $msg"
+        nanoLog.text = nanoLines.joinToString("\n")
+    }
+
     private fun checkNano() {
         nanoBtn.isEnabled = false
-        nanoBtn.text = "나노 상태 확인 중…"
+        nanoBtn.text = "나노 진단 중… (최대 2분)"
+        nanoLines.clear()
+        nanoStart = System.currentTimeMillis()
+        nanoLog.visibility = View.VISIBLE
+        NanoClient.close()
         scope.launch {
             try {
-                when (NanoClient.status()) {
-                    FeatureStatus.AVAILABLE -> {
-                        nanoBtn.text = "③ 나노 준비 완료 ✅ — 테스트 번역 중…"
-                        testNano()
-                    }
-                    FeatureStatus.DOWNLOADABLE, FeatureStatus.DOWNLOADING -> downloadNano()
-                    else -> {
-                        nanoBtn.text = "③ 이 폰은 나노를 지원 안 함 ❌"
-                    }
+                // 1) 상태 확인
+                log("1/4 상태 확인…")
+                val st = withTimeoutOrNull(15_000) { NanoClient.status() }
+                when (st) {
+                    null -> { log("❌ 상태 확인이 15초 넘게 멈춤 (AICore 응답 없음)"); return@launch }
+                    FeatureStatus.AVAILABLE -> log("상태: 사용 가능")
+                    FeatureStatus.DOWNLOADABLE -> log("상태: 다운로드 필요")
+                    FeatureStatus.DOWNLOADING -> log("상태: 다운로드 중")
+                    FeatureStatus.UNAVAILABLE -> { log("❌ 이 폰/계정에선 나노 사용 불가 (UNAVAILABLE)"); return@launch }
+                    else -> log("상태: 알 수 없음($st)")
                 }
+                // 2) 필요하면 다운로드
+                if (st == FeatureStatus.DOWNLOADABLE || st == FeatureStatus.DOWNLOADING) {
+                    log("2/4 모델 다운로드…")
+                    downloadNano()
+                } else log("2/4 다운로드 필요 없음")
+                // 3) 메모리에 올리기
+                log("3/4 모델 준비(warmup)…")
+                val warmed = withTimeoutOrNull(45_000) { NanoClient.warmup(); true }
+                log(if (warmed == null) "⚠️ warmup 45초 초과 — 계속 진행" else "warmup 완료")
+                // 4) 테스트 번역: 한 번에 받기 → 스트리밍
+                log("4/4 테스트 번역(한 번에 받기)…")
+                val sample = listOf("Welcome back, adventurer!", "Your inventory is full.")
+                val out = arrayOfNulls<String>(sample.size)
+                val t0 = System.currentTimeMillis()
+                NanoClient.translateLines(sample, SourceLang.EN, stream = false, batchTimeoutMs = 45_000) { i, ko -> out[i] = ko }
+                log("결과(${(System.currentTimeMillis() - t0) / 100 / 10.0}초): ${out[0] ?: "?"} / ${out[1] ?: "?"}")
+                log("4/4 테스트 번역(스트리밍)…")
+                val out2 = arrayOfNulls<String>(sample.size)
+                val t1 = System.currentTimeMillis()
+                NanoClient.translateLines(sample, SourceLang.EN, stream = true, batchTimeoutMs = 45_000) { i, ko -> out2[i] = ko }
+                log("결과(${(System.currentTimeMillis() - t1) / 100 / 10.0}초): ${out2[0] ?: "?"} / ${out2[1] ?: "?"}")
+                log("✅ 진단 끝 — 이 화면 캡처해서 보내줘")
             } catch (e: CancellationException) {
-                throw e
+                if (e is TimeoutCancellationException) log("❌ 시간 초과: 나노가 응답을 안 줌")
+                else throw e
             } catch (e: Exception) {
-                nanoBtn.text = "③ 나노 확인 실패 — 다시 누르기"
-                Toast.makeText(this@MainActivity, "나노 오류: ${e.message}", Toast.LENGTH_LONG).show()
+                log("❌ 오류 — ${NanoClient.describe(e)}")
             } finally {
                 nanoBtn.isEnabled = true
+                nanoBtn.text = "③ 나노 진단 다시 하기"
             }
         }
     }
 
     private suspend fun downloadNano() {
         var total = 0L
+        var lastLogged = -1L
         NanoClient.download().collect { st ->
             when (st) {
                 is DownloadStatus.DownloadStarted -> {
                     total = st.bytesToDownload
-                    nanoBtn.text = "나노 받는 중… (${total / 1_000_000}MB, 와이파이 권장)"
+                    log("다운로드 시작 (${total / 1_000_000}MB)")
                 }
                 is DownloadStatus.DownloadProgress -> {
                     val mb = st.totalBytesDownloaded / 1_000_000
                     nanoBtn.text = if (total > 0) "나노 받는 중… ${mb}/${total / 1_000_000}MB" else "나노 받는 중… ${mb}MB"
+                    if (mb / 100 != lastLogged) { lastLogged = mb / 100; log("받는 중 ${mb}MB") }
                 }
-                is DownloadStatus.DownloadFailed -> {
-                    nanoBtn.text = "③ 나노 다운로드 실패 — 다시 누르기"
-                    Toast.makeText(this, "실패: ${st.e.message}", Toast.LENGTH_LONG).show()
-                }
-                else -> {
-                    nanoBtn.text = "③ 나노 준비 완료 ✅ — 테스트 번역 중…"
-                    testNano()
-                }
+                is DownloadStatus.DownloadFailed -> log("❌ 다운로드 실패 — ${NanoClient.describe(st.e)}")
+                else -> log("다운로드 완료")
             }
         }
-    }
-
-    /** 한국어로 잘 나오는지 바로 확인 (이 화면이 앞에 있어서 나노가 동작함) */
-    private suspend fun testNano() {
-        val start = System.currentTimeMillis()
-        val sample = listOf("Welcome back, adventurer!", "Your inventory is full.")
-        val out = arrayOfNulls<String>(sample.size)
-        NanoClient.translateLines(sample, SourceLang.EN) { i, ko -> out[i] = ko }
-        val sec = (System.currentTimeMillis() - start) / 100 / 10.0
-        nanoBtn.text = "③ 나노 준비 완료 ✅ (테스트 ${sec}초)"
-        Toast.makeText(
-            this,
-            "나노 테스트:\n${sample[0]} → ${out[0] ?: "?"}\n${sample[1]} → ${out[1] ?: "?"}",
-            Toast.LENGTH_LONG
-        ).show()
     }
 
     private fun downloadModel() {

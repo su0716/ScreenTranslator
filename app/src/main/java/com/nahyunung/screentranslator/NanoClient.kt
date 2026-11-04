@@ -11,6 +11,7 @@ import com.google.mlkit.genai.prompt.generateContentRequest
 import com.google.mlkit.genai.prompt.generationConfig
 import com.google.mlkit.genai.prompt.modelConfig
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.withTimeout
 
 /**
  * [실험] 폰 안의 Gemini Nano로 번역 (인터넷·서버 대기 없음).
@@ -25,14 +26,34 @@ object NanoClient {
 
     private var model: GenerativeModel? = null
 
-    private fun client(): GenerativeModel = model ?: Generation.getClient(
-        generationConfig {
-            modelConfig = modelConfig {
-                releaseStage = ModelReleaseStage.STABLE
-                preference = ModelPreference.FAST // 품질보다 속도
+    /** true면 FAST 모델 설정, false면 기본 설정 (기기마다 FAST가 없을 수 있어서 기본값 사용) */
+    var useFast = false
+
+    private fun client(): GenerativeModel = model ?: (
+        if (useFast) Generation.getClient(
+            generationConfig {
+                modelConfig = modelConfig {
+                    releaseStage = ModelReleaseStage.STABLE
+                    preference = ModelPreference.FAST
+                }
             }
-        }
-    ).also { model = it }
+        ) else Generation.getClient()
+        ).also { model = it }
+
+    /** 모델을 메모리에 미리 올림 (첫 호출이 느린 걸 줄임) */
+    suspend fun warmup() = client().warmup()
+
+    /** 스트리밍 없이 한 번에 받기 (진단용) */
+    suspend fun generateOnce(prompt: String): String {
+        val r = client().generateContent(generateContentRequest(TextPart(prompt)) { temperature = 0.1f })
+        return r.candidates.firstOrNull()?.text ?: ""
+    }
+
+    /** 에러를 사람이 읽을 수 있게: 클래스 + 에러코드 + 메시지 */
+    fun describe(e: Throwable): String {
+        val code = (e as? GenAiException)?.errorCode?.let { " 코드 $it" } ?: ""
+        return "${e.javaClass.simpleName}$code: ${e.message ?: "-"}"
+    }
 
     /** FeatureStatus 값 (UNAVAILABLE / DOWNLOADABLE / DOWNLOADING / AVAILABLE) */
     suspend fun status(): Int = client().checkStatus()
@@ -85,6 +106,8 @@ object NanoClient {
     suspend fun translateLines(
         texts: List<String>,
         lang: SourceLang,
+        stream: Boolean = true,
+        batchTimeoutMs: Long = 25_000,
         onTranslated: (Int, String) -> Unit
     ): Int {
         var count = 0
@@ -104,14 +127,23 @@ object NanoClient {
                 onTranslated(batch[local], ko)
                 count++
             }
-            client().generateContentStream(request).collect { chunk ->
-                val t = chunk.candidates.firstOrNull()?.text ?: return@collect
-                buf.append(t)
-                while (true) {
-                    val nl = buf.indexOf("\n")
-                    if (nl < 0) break
-                    handleLine(buf.substring(0, nl))
-                    buf.delete(0, nl + 1)
+            // 한 묶음이 너무 오래 걸리면 포기 (멈춤 방지)
+            withTimeout(batchTimeoutMs) {
+                if (stream) {
+                    client().generateContentStream(request).collect { chunk ->
+                        val t = chunk.candidates.firstOrNull()?.text ?: return@collect
+                        buf.append(t)
+                        while (true) {
+                            val nl = buf.indexOf("\n")
+                            if (nl < 0) break
+                            handleLine(buf.substring(0, nl))
+                            buf.delete(0, nl + 1)
+                        }
+                    }
+                } else {
+                    buf.append(client().generateContent(request).candidates.firstOrNull()?.text ?: "")
+                    buf.split("\n").forEach { handleLine(it) }
+                    buf.clear()
                 }
             }
             if (buf.isNotBlank()) handleLine(buf.toString())
