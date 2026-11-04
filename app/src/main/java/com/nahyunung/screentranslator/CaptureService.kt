@@ -42,6 +42,7 @@ import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognizer
+import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.min
 
@@ -67,6 +68,7 @@ class CaptureService : Service() {
 
     private lateinit var wm: WindowManager
     private val main = Handler(Looper.getMainLooper())
+    private val net = Executors.newSingleThreadExecutor()
 
     // 캡처
     private var projection: MediaProjection? = null
@@ -143,6 +145,7 @@ class CaptureService : Service() {
     override fun onDestroy() {
         running = false
         teardown()
+        net.shutdownNow()
         super.onDestroy()
     }
 
@@ -310,7 +313,10 @@ class CaptureService : Service() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-    private fun buttonLabel() = "번역\n${lang.short}"
+    private fun buttonLabel(): String {
+        val e = Prefs.engine(this)
+        return if (e == Engine.GEMINI) "번역\nAI·${lang.short}" else "번역\n${lang.short}"
+    }
 
     @SuppressLint("ClickableViewAccessibility")
     private fun showButton() {
@@ -432,6 +438,25 @@ class CaptureService : Service() {
                 }
             })
         }
+        // 구분선 + 엔진 전환
+        menu.addView(View(this).apply {
+            setBackgroundColor(Color.argb(80, 255, 255, 255))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)).apply {
+                topMargin = dp(4); bottomMargin = dp(4)
+            }
+        })
+        val engine = Prefs.engine(this)
+        menu.addView(TextView(this).apply {
+            text = if (engine == Engine.GEMINI) "엔진: AI ⇄" else "엔진: 오프 ⇄"
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setTextColor(Color.argb(220, 255, 255, 255))
+            setPadding(0, dp(8), 0, dp(8))
+            setOnClickListener {
+                hideLangMenu()
+                switchEngine(if (engine == Engine.GEMINI) Engine.MLKIT else Engine.GEMINI)
+            }
+        })
         // 버튼이 화면 오른쪽에 있으면 메뉴는 왼쪽, 아니면 오른쪽에
         val onRight = buttonParams.x + btnSize / 2 > screenW / 2
         val p = WindowManager.LayoutParams(
@@ -477,12 +502,41 @@ class CaptureService : Service() {
         val tr = l.translator()
         translator = tr
         setButtonState(buttonLabel())
-        // 번역 모델이 없으면 미리 받아두기
+        if (Prefs.engine(this) == Engine.GEMINI) {
+            toast("${l.label} → 한국어 (AI)")
+            return
+        }
+        // 오프라인 모드: 번역 모델이 없으면 미리 받아두기
         busy = true
         setButtonState("받는중")
         tr.downloadModelIfNeeded()
             .addOnSuccessListener { toast("${l.label} → 한국어 준비 완료") }
             .addOnFailureListener { e -> toast("${l.label} 모델 다운로드 실패 (인터넷 확인): ${e.message}") }
+            .addOnCompleteListener {
+                busy = false
+                setButtonState(buttonLabel())
+            }
+    }
+
+    private fun switchEngine(e: Engine) {
+        if (busy) {
+            toast("번역 중엔 바꿀 수 없어")
+            return
+        }
+        Prefs.setEngine(this, e)
+        removeOverlay()
+        setButtonState(buttonLabel())
+        if (e == Engine.GEMINI) {
+            if (Prefs.apiKey(this).isBlank()) toast("앱 설정에 제미나이 API 키를 넣어줘")
+            else toast("AI 번역 모드")
+            return
+        }
+        val tr = translator ?: return
+        busy = true
+        setButtonState("받는중")
+        tr.downloadModelIfNeeded()
+            .addOnSuccessListener { toast("오프라인 모드 (${lang.label} → 한국어)") }
+            .addOnFailureListener { ex -> toast("모델 다운로드 실패 (인터넷 확인): ${ex.message}") }
             .addOnCompleteListener {
                 busy = false
                 setButtonState(buttonLabel())
@@ -495,6 +549,18 @@ class CaptureService : Service() {
         if (busy) return
         if (overlay != null) { // 번역 화면 떠 있으면 닫기만
             removeOverlay()
+            return
+        }
+        // 앱 화면에서 언어를 바꿨으면 반영
+        val pref = Prefs.source(this)
+        if (pref != lang) {
+            recognizer?.close(); translator?.close()
+            lang = pref
+            recognizer = pref.recognizer()
+            translator = pref.translator()
+        }
+        if (Prefs.engine(this) == Engine.GEMINI && Prefs.apiKey(this).isBlank()) {
+            toast("앱 설정에 제미나이 API 키를 넣어줘")
             return
         }
         busy = true
@@ -516,11 +582,42 @@ class CaptureService : Service() {
             finishWork("화면을 못 가져왔어. 다시 눌러봐")
             return
         }
+        if (Prefs.engine(this) == Engine.GEMINI) {
+            translateWithGemini(bmp)
+            return
+        }
         val rec = recognizer ?: return finishWork()
         rec.process(InputImage.fromBitmap(bmp, 0))
             .addOnSuccessListener { result -> translateBlocks(result) }
             .addOnFailureListener { e -> finishWork("글자 인식 실패: ${e.message}") }
             .addOnCompleteListener { bmp.recycle() }
+    }
+
+    private fun translateWithGemini(bmp: Bitmap) {
+        val key = Prefs.apiKey(this)
+        val model = Prefs.model(this)
+        val l = lang
+        val w = screenW
+        val h = screenH
+        setButtonState("AI…")
+        net.execute {
+            val result = runCatching { GeminiClient.translate(bmp, l, key, model, w, h) }
+            bmp.recycle()
+            main.post {
+                result.onSuccess { items ->
+                    if (items.isEmpty()) finishWork("번역할 외국어를 못 찾았어")
+                    else {
+                        showOverlay(items)
+                        finishWork()
+                    }
+                }.onFailure { e ->
+                    finishWork(
+                        if (e is GeminiClient.GeminiException) e.message
+                        else "AI 번역 실패 (인터넷 확인): ${e.message}"
+                    )
+                }
+            }
+        }
     }
 
     private fun blockText(b: Text.TextBlock): String =

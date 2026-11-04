@@ -15,6 +15,7 @@ import android.view.View
 import android.view.ViewConfiguration
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 
 /** 번역된 글자 덩어리 하나 (rect는 실제 화면 좌표) */
 data class OverlayItem(val rect: Rect, val text: String, val lineCount: Int)
@@ -80,7 +81,10 @@ class TranslateOverlayView(
     /** 각 박스에 들어가도록 글자 크기를 줄여가며 맞춤. 그래도 넘치면 박스를 아래로 늘림. */
     private fun place(screenW: Int): MutableList<Placed> = items.map { item ->
         val r = item.rect
-        val boxW = max(r.width().toFloat(), 48 * density)
+        var boxW = max(r.width().toFloat(), 48 * density)
+        // 세로쓰기 칸(좁고 긴 박스)은 한국어 가로쓰기가 들어가도록 넓혀서 가운데 정렬
+        val vertical = r.height() > r.width() * 1.6f
+        if (vertical) boxW = max(boxW, min(r.height() * 0.7f, screenW * 0.45f))
         val innerW = (boxW - 2 * pad).toInt()
         val innerH = r.height() - 2 * pad
 
@@ -94,9 +98,12 @@ class TranslateOverlayView(
             layout = build(item.text, paint, innerW)
         }
 
-        var left = r.left.toFloat()
-        if (left + boxW > screenW) left = max(0f, screenW - boxW)
-        val boxH = max(r.height().toFloat(), layout.height + 2 * pad)
+        var left = if (vertical) r.exactCenterX() - boxW / 2 else r.left.toFloat()
+        if (left + boxW > screenW) left = screenW - boxW
+        left = max(0f, left)
+        // 세로 박스는 글이 들어갈 만큼만 높이 사용, 가로 박스는 원문을 덮도록
+        val boxH = if (vertical) layout.height + 2 * pad
+                   else max(r.height().toFloat(), layout.height + 2 * pad)
         Placed(RectF(left, r.top.toFloat(), left + boxW, r.top + boxH), layout)
     }.toMutableList()
 

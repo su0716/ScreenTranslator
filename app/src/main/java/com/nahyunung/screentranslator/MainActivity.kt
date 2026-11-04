@@ -12,7 +12,9 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
+import android.text.InputType
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
@@ -31,6 +33,7 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var modelBtn: Button
     private lateinit var langGroup: RadioGroup
+    private lateinit var engineGroup: RadioGroup
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -41,6 +44,7 @@ class MainActivity : Activity() {
         super.onResume()
         // 떠 있는 버튼에서 언어를 바꿨을 수도 있으니 다시 반영
         if (::langGroup.isInitialized) langGroup.check(1000 + Prefs.source(this).ordinal)
+        if (::engineGroup.isInitialized) engineGroup.check(2000 + Prefs.engine(this).ordinal)
         refreshStatus()
     }
 
@@ -61,7 +65,7 @@ class MainActivity : Activity() {
             setTextColor(Color.BLACK)
         })
         root.addView(TextView(this).apply {
-            text = "다른 앱 위에 떠 있는 '번역' 버튼을 누르면 지금 화면의 글자를 한국어로 덮어씌워 줘. 번역 박스는 끌어서 옮길 수 있고, 빈 곳을 탭하면 닫혀. 버튼을 꾹 누르면 언어를 바꿀 수 있어."
+            text = "다른 앱 위에 떠 있는 '번역' 버튼을 누르면 지금 화면의 글자를 한국어로 덮어씌워 줘. 번역 박스는 끌어서 옮길 수 있고, 빈 곳을 탭하면 닫혀. 버튼을 꾹 누르면 언어·엔진을 바꿀 수 있어."
             textSize = 14f
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(8), 0, dp(24))
@@ -86,9 +90,52 @@ class MainActivity : Activity() {
         root.addView(group)
         langGroup = group
 
+        // 번역 엔진
+        root.addView(label("번역 엔진").apply { setPadding(0, dp(20), 0, dp(8)) })
+        val engineGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
+        val curEngine = Prefs.engine(this)
+        Engine.values().forEachIndexed { i, e ->
+            engineGroup.addView(RadioButton(this).apply {
+                id = 2000 + i
+                text = if (e == Engine.GEMINI) "AI (제미나이) — 고품질, 세로글씨 OK, 인터넷 필요"
+                       else "오프라인 (ML Kit) — 빠름, 품질 낮음"
+                textSize = 15f
+                isChecked = e == curEngine
+            })
+        }
+        engineGroup.setOnCheckedChangeListener { _, id ->
+            Prefs.setEngine(this, Engine.values()[id - 2000])
+            refreshStatus()
+        }
+        root.addView(engineGroup)
+        this.engineGroup = engineGroup
+
+        // 제미나이 설정
+        root.addView(label("제미나이 API 키 (aistudio.google.com에서 발급)").apply { setPadding(0, dp(16), 0, dp(4)) })
+        val keyInput = EditText(this).apply {
+            hint = "여기에 키 붙여넣기"
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setText(Prefs.apiKey(this@MainActivity))
+        }
+        root.addView(keyInput)
+        root.addView(label("모델 (보통 그대로 두기)").apply { setPadding(0, dp(8), 0, dp(4)) })
+        val modelInput = EditText(this).apply {
+            setSingleLine()
+            setText(Prefs.model(this@MainActivity))
+        }
+        root.addView(modelInput)
+        root.addView(bigButton("키·모델 저장") {
+            Prefs.setApiKey(this, keyInput.text.toString())
+            Prefs.setModel(this, modelInput.text.toString().ifBlank { Prefs.DEFAULT_MODEL })
+            modelInput.setText(Prefs.model(this))
+            Toast.makeText(this, "저장했어", Toast.LENGTH_SHORT).show()
+            refreshStatus()
+        })
+
         root.addView(label("준비").apply { setPadding(0, dp(24), 0, dp(8)) })
         root.addView(bigButton("① 다른 앱 위에 표시 권한 켜기") { openOverlaySettings() })
-        modelBtn = bigButton("② 번역 모델 받기 (처음 1회, 와이파이 권장)") { downloadModel() }
+        modelBtn = bigButton("② 오프라인 번역 모델 받기 (오프라인 엔진용)") { downloadModel() }
         root.addView(modelBtn)
 
         root.addView(label("실행").apply { setPadding(0, dp(24), 0, dp(8)) })
@@ -139,7 +186,10 @@ class MainActivity : Activity() {
         if (!::status.isInitialized) return
         val overlay = if (Settings.canDrawOverlays(this)) "✅ 켜짐" else "❌ 꺼짐"
         val running = if (CaptureService.running) "🟢 실행 중" else "⚪ 꺼짐"
-        status.text = "표시 권한: $overlay\n번역 버튼: $running\n원문 언어: ${Prefs.source(this).label} → 한국어"
+        val engine = Prefs.engine(this)
+        val key = if (Prefs.apiKey(this).isBlank()) "❌ 없음" else "✅ 저장됨"
+        status.text = "표시 권한: $overlay\n번역 버튼: $running\n원문 언어: ${Prefs.source(this).label} → 한국어\n" +
+            "엔진: ${engine.label}" + (if (engine == Engine.GEMINI) "\nAPI 키: $key" else "")
     }
 
     // ---------- 권한 / 모델 ----------
