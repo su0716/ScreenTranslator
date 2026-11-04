@@ -42,7 +42,8 @@ enum class SourceLang(
 enum class Engine(val label: String, val short: String, val usesGemini: Boolean) {
     GEMINI("AI 정밀", "AI", true),      // 이미지째 보냄: 세로쓰기 OK, 느림
     HYBRID("AI 빠름", "빠름", true),     // 폰에서 글자 찾고 글자만 보냄: 빠름, 세로쓰기 약함
-    MLKIT("오프라인", "오프", false);    // 전부 폰에서: 인터넷 X, 품질 낮음
+    MLKIT("오프라인", "오프", false),    // 전부 폰에서: 인터넷 X, 품질 낮음
+    NANO("나노(실험)", "나노", false);   // 폰 안의 Gemini Nano로 번역: 인터넷 X, 실험 중
 
     fun next(): Engine = values()[(ordinal + 1) % values().size]
 }
@@ -106,6 +107,6 @@ object TranslationCache {
     }
 
     private fun key(lang: SourceLang, text: String) = "${lang.name}|${text.trim()}"
-    fun get(lang: SourceLang, text: String): String? = map[key(lang, text)]
-    fun put(lang: SourceLang, text: String, ko: String) { map[key(lang, text)] = ko }
+    fun get(lang: SourceLang, text: String, ns: String = ""): String? = map[ns + key(lang, text)]
+    fun put(lang: SourceLang, text: String, ko: String, ns: String = "") { map[ns + key(lang, text)] = ko }
 }

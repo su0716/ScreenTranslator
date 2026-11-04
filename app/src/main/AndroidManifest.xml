@@ -24,6 +24,16 @@
             </intent-filter>
         </activity>
 
+        <!-- [실험] 나노 호출 동안만 잠깐 뜨는 투명 화면 -->
+        <activity
+            android:name=".NanoActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:screenOrientation="behind"
+            android:theme="@style/NanoTheme" />
+
         <service
             android:name=".CaptureService"
             android:exported="false"

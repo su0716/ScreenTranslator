@@ -43,6 +43,13 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognizer
 import java.util.concurrent.Executors
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.min
 
@@ -146,12 +153,16 @@ class CaptureService : Service() {
         running = false
         teardown()
         net.shutdownNow()
+        scope.cancel()
+        NanoClient.close()
         super.onDestroy()
     }
 
     private fun teardown() {
         job++
         cancelToken?.cancel()
+        nanoJob?.cancel()
+        NanoGate.close()
         main.removeCallbacks(watchdog)
         hideLangMenu()
         removeRegionSelect()
@@ -541,6 +552,10 @@ class CaptureService : Service() {
             else toast(if (e == Engine.GEMINI) "AI 정밀 (세로글씨 OK)" else "AI 빠름 (가로글씨용)")
             return
         }
+        if (e == Engine.NANO) {
+            toast("나노(실험) — 처음이면 앱에서 '나노 모델 확인' 먼저")
+            return
+        }
         val tr = translator ?: return
         busy = true
         setButtonState("받는중")
@@ -590,6 +605,8 @@ class CaptureService : Service() {
     private fun cancelWork(msg: String) {
         job++
         cancelToken?.cancel()
+        nanoJob?.cancel()
+        NanoGate.close()
         finishWork(msg)
     }
 
@@ -690,6 +707,7 @@ class CaptureService : Service() {
             Engine.GEMINI -> translateWithGemini(bmp, target, id)
             Engine.HYBRID -> recognizeThen(bmp, id) { blocks -> translateHybrid(blocks, bmp, target, id) }
             Engine.MLKIT -> recognizeThen(bmp, id) { blocks -> translateOffline(blocks, bmp, target, id) }
+            Engine.NANO -> recognizeThen(bmp, id) { blocks -> translateNano(blocks, bmp, target, id) }
         }
     }
 
@@ -731,7 +749,7 @@ class CaptureService : Service() {
         if (ov == null) showOverlay(listOf(item)) else ov.addItem(item)
     }
 
-    private fun finishAi(session: Int, started: Long, result: Result<Int>, cachedCount: Int = 0) {
+    private fun finishAi(session: Int, started: Long, result: Result<Int>, cachedCount: Int = 0, note: String = "") {
         if (session != job) return
         result.onSuccess { count ->
             val total = count + cachedCount
@@ -739,8 +757,9 @@ class CaptureService : Service() {
             else {
                 val sec = (System.currentTimeMillis() - started) / 100 / 10.0
                 finishWork()
-                if (Prefs.showTiming(this)) {
-                    toast(if (cachedCount > 0) "${total}개 (저장된 ${cachedCount}개) · ${sec}초" else "${total}개 · ${sec}초")
+                if (Prefs.showTiming(this) || note.contains("→")) {
+                    val head = if (note.isNotEmpty()) "$note · " else ""
+                    toast(head + if (cachedCount > 0) "${total}개 (저장된 ${cachedCount}개) · ${sec}초" else "${total}개 · ${sec}초")
                 }
             }
         }.onFailure { e ->
@@ -777,36 +796,49 @@ class CaptureService : Service() {
         }
     }
 
+    /** 번역할 글자 하나: 화면 위치, 원문, 줄 수 */
+    private data class Entry(val rect: Rect, val text: String, val lines: Int)
+
+    private fun entriesOf(blocks: List<Text.TextBlock>, bmp: Bitmap, target: Rect) = blocks.map { b ->
+        Entry(blockRect(b, bmp, target), blockText(b), b.lines.size.coerceAtLeast(1))
+    }
+
+    /** 전에 번역한 문장은 바로 표시하고, 남은 것만 돌려줌 */
+    private fun deliverCached(entries: List<Entry>, ns: String, session: Int): Pair<List<Entry>, Int> {
+        val todo = mutableListOf<Entry>()
+        var cached = 0
+        for (e in entries) {
+            val hit = TranslationCache.get(lang, e.text, ns)
+            if (hit != null) {
+                deliver(OverlayItem(e.rect, hit, e.lines), session)
+                cached++
+            } else todo += e
+        }
+        return todo to cached
+    }
+
     /** [AI 빠름] 폰에서 찾은 글자만 보내기 + 번역 저장해서 재사용 */
     private fun translateHybrid(blocks: List<Text.TextBlock>, bmp: Bitmap, target: Rect, session: Int) {
         val started = System.currentTimeMillis()
         aiClosedByUser = false
-        val l = lang
-        val entries = blocks.map { b ->
-            Triple(blockRect(b, bmp, target), blockText(b), b.lines.size.coerceAtLeast(1))
-        }
-        // 전에 번역한 문장은 바로 표시
-        val todo = mutableListOf<Triple<Rect, String, Int>>()
-        var cached = 0
-        for (e in entries) {
-            val hit = TranslationCache.get(l, e.second)
-            if (hit != null) {
-                deliver(OverlayItem(e.first, hit, e.third), session)
-                cached++
-            } else todo += e
-        }
+        val (todo, cached) = deliverCached(entriesOf(blocks, bmp, target), "", session)
         if (todo.isEmpty()) {
             finishAi(session, started, Result.success(0), cached)
             return
         }
+        sendTextsToGemini(todo, session, started, cached)
+    }
 
+    /** 글자들을 제미나이로 번역 (AI 빠름 / 나노 실패 시 대체) */
+    private fun sendTextsToGemini(todo: List<Entry>, session: Int, started: Long, cached: Int, note: String = "") {
+        val l = lang
         val key = Prefs.apiKey(this)
         val model = Prefs.model(this)
         val relaxed = Prefs.relaxedSafety(this)
         val token = GeminiClient.CancelToken()
         cancelToken = token
         busyLabel("AI…")
-        val texts = todo.map { it.second }
+        val texts = todo.map { it.text }
         net.execute {
             val result = runCatching {
                 GeminiClient.translateTexts(
@@ -818,12 +850,72 @@ class CaptureService : Service() {
                         main.post {
                             TranslationCache.put(l, texts[i], ko)
                             val e = todo[i]
-                            deliver(OverlayItem(e.first, ko, e.third), session)
+                            deliver(OverlayItem(e.rect, ko, e.lines), session)
                         }
                     }
                 )
             }
-            main.post { finishAi(session, started, result, cached) }
+            main.post { finishAi(session, started, result, cached, note) }
+        }
+    }
+
+    // ---------------- [실험] 나노 ----------------
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var nanoJob: Job? = null
+
+    /** [나노] 폰 안의 Gemini Nano로 번역. 막히면 AI 빠름으로 자동 전환 */
+    private fun translateNano(blocks: List<Text.TextBlock>, bmp: Bitmap, target: Rect, session: Int) {
+        val started = System.currentTimeMillis()
+        aiClosedByUser = false
+        val l = lang
+        val (todo, cached) = deliverCached(entriesOf(blocks, bmp, target), "nano:", session)
+        if (todo.isEmpty()) {
+            finishAi(session, started, Result.success(0), cached)
+            return
+        }
+        busyLabel("나노…")
+        nanoJob = scope.launch {
+            val texts = todo.map { it.text }
+            var delivered = 0
+            val result = runCatching {
+                // 나노는 우리 앱이 맨 앞일 때만 동작 → 투명 화면을 잠깐 띄움
+                val front = NanoGate.open(this@CaptureService)
+                if (!front) throw IllegalStateException("투명 화면을 못 띄웠어")
+                try {
+                    NanoClient.translateLines(texts, l) { i, ko ->
+                        TranslationCache.put(l, texts[i], ko, "nano:")
+                        val e = todo[i]
+                        deliver(OverlayItem(e.rect, ko, e.lines), session)
+                        delivered++
+                    }
+                } finally {
+                    NanoGate.close()
+                }
+            }
+            if (session != job) return@launch
+            val err = result.exceptionOrNull()
+            if (err is CancellationException) return@launch
+            // 하나도 못 받았고 제미나이 키가 있으면 AI 빠름으로 대신 번역
+            if (err != null && delivered == 0 && Prefs.apiKey(this@CaptureService).isNotBlank()) {
+                val why = when {
+                    NanoClient.isBackgroundBlocked(err) -> "나노 막힘(앞 화면 아님)"
+                    else -> "나노 실패"
+                }
+                sendTextsToGemini(todo, session, started, cached, note = "$why → AI 빠름으로 번역")
+                return@launch
+            }
+            finishAi(
+                session, started,
+                result.map { delivered }.recoverCatching {
+                    if (delivered > 0) delivered
+                    else throw Exception(
+                        if (NanoClient.isBackgroundBlocked(it)) "나노가 막혔어 (앱이 앞 화면이 아니래)"
+                        else "나노 번역 실패: ${it.message}"
+                    )
+                },
+                cached, note = "나노"
+            )
         }
     }
 

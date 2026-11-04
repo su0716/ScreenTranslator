@@ -37,8 +37,11 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
 }
 
@@ -49,4 +52,7 @@ dependencies {
     implementation("com.google.mlkit:text-recognition-chinese:16.0.1")    // 중국어
     // 번역 — 언어 모델은 처음 한 번만 다운로드 (언어당 약 30MB)
     implementation("com.google.mlkit:translate:17.0.3")
+    // [실험] 폰 안의 Gemini Nano (갤럭시 S26 등 지원 기기만)
+    implementation("com.google.mlkit:genai-prompt:1.0.0-beta5")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 }

@@ -2,7 +2,7 @@ name: Build APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, nano]
   workflow_dispatch:
 
 permissions:
@@ -27,12 +27,13 @@ jobs:
           ./gradlew assembleDebug --stacktrace
 
       - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk ScreenTranslator-${{ github.run_number }}.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk ScreenTranslator-${{ github.run_number }}${{ github.ref_name != 'main' && format('-{0}', github.ref_name) || '' }}.apk
 
       # 폰에서 바로 받을 수 있게 Releases에 올림
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: 화면번역 빌드 ${{ github.run_number }}
-          files: ScreenTranslator-${{ github.run_number }}.apk
-          make_latest: true
+          name: ${{ github.ref_name != 'main' && '[실험] ' || '' }}화면번역 빌드 ${{ github.run_number }}
+          files: ScreenTranslator-*.apk
+          prerelease: ${{ github.ref_name != 'main' }}
+          make_latest: ${{ github.ref_name == 'main' }}
