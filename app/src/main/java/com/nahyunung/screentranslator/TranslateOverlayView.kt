@@ -133,6 +133,31 @@ class TranslateOverlayView(
         placed = null
     }
 
+    // 박스 탭 → 선택(지우기 버튼 표시)
+    private var selected: Placed? = null
+    private val deleteRect = RectF()  // 지우기 버튼 위치 (화면 좌표)
+    private var pressingDelete = false
+
+    private val deleteBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(229, 57, 53) }
+    private val deleteText = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = 13 * scaled
+        textAlign = Paint.Align.CENTER
+        isFakeBoldText = true
+    }
+
+    /** 선택된 박스의 오른쪽 위에 "✕ 지우기" 버튼 위치 계산 (화면 밖으로 안 나가게) */
+    private fun updateDeleteRect(p: Placed) {
+        val w = deleteText.measureText("✕ 지우기") + 20 * density
+        val h = 30 * density
+        val screenRight = (loc[0] + width).toFloat()
+        var left = p.box.right - w
+        var top = p.box.top - h - 4 * density
+        if (top < loc[1] + 4 * density) top = p.box.bottom + 4 * density // 위에 자리 없으면 아래로
+        left = left.coerceIn(loc[0].toFloat(), screenRight - w)
+        deleteRect.set(left, top, left + w, top + h)
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(e: MotionEvent): Boolean {
         val list = ensurePlaced()
@@ -141,6 +166,9 @@ class TranslateOverlayView(
                 downX = e.rawX; downY = e.rawY
                 lastX = e.rawX; lastY = e.rawY
                 moved = false
+                // 지우기 버튼 먼저 검사
+                pressingDelete = selected != null && deleteRect.contains(e.rawX, e.rawY)
+                if (pressingDelete) return true
                 // 맨 위에 그려진 박스부터 검사
                 dragging = list.lastOrNull { it.box.contains(e.rawX, e.rawY) }
                 dragging?.let {
@@ -151,6 +179,7 @@ class TranslateOverlayView(
                 }
             }
             MotionEvent.ACTION_MOVE -> {
+                if (pressingDelete) return true
                 if (!moved && (abs(e.rawX - downX) > slop || abs(e.rawY - downY) > slop)) moved = true
                 if (moved) {
                     dragging?.box?.offset(e.rawX - lastX, e.rawY - lastY)
@@ -159,13 +188,32 @@ class TranslateOverlayView(
                 lastX = e.rawX; lastY = e.rawY
             }
             MotionEvent.ACTION_UP -> {
-                // 빈 곳을 그냥 탭했을 때만 닫기
-                if (dragging == null && !moved) onClose()
+                if (pressingDelete) {
+                    pressingDelete = false
+                    val target = selected
+                    if (target != null && deleteRect.contains(e.rawX, e.rawY)) {
+                        list.remove(target)
+                        selected = null
+                        if (list.isEmpty()) { onClose(); return true } // 다 지우면 닫기
+                    }
+                    invalidate()
+                    return true
+                }
+                val d = dragging
+                when {
+                    // 박스를 그냥 탭 → 선택/선택 해제 (지우기 버튼 토글)
+                    d != null && !moved -> selected = if (selected === d) null else d
+                    // 박스를 끌었으면 그 박스를 선택 상태로 유지하지 않음
+                    d != null -> if (selected === d) selected = null
+                    // 빈 곳 탭: 선택 중이면 선택만 해제, 아니면 닫기
+                    !moved -> if (selected != null) selected = null else onClose()
+                }
                 dragging = null
                 invalidate()
             }
             MotionEvent.ACTION_CANCEL -> {
                 dragging = null
+                pressingDelete = false
                 invalidate()
             }
         }
@@ -181,17 +229,30 @@ class TranslateOverlayView(
         canvas.translate(-loc[0].toFloat(), -loc[1].toFloat())
         for (p in list) {
             canvas.drawRoundRect(p.box, radius, radius, bgPaint)
-            canvas.drawRoundRect(p.box, radius, radius, if (p === dragging) dragBorderPaint else borderPaint)
+            canvas.drawRoundRect(p.box, radius, radius,
+                if (p === dragging || p === selected) dragBorderPaint else borderPaint)
             canvas.save()
             val dy = (p.box.height() - p.layout.height) / 2f
             canvas.translate(p.box.left + pad, p.box.top + max(pad, dy))
             p.layout.draw(canvas)
             canvas.restore()
         }
+        // 선택된 박스의 지우기 버튼
+        selected?.let { p ->
+            if (p in list) {
+                updateDeleteRect(p)
+                canvas.drawRoundRect(deleteRect, deleteRect.height() / 2, deleteRect.height() / 2, deleteBg)
+                canvas.drawText(
+                    "✕ 지우기", deleteRect.centerX(),
+                    deleteRect.centerY() + deleteText.textSize / 3, deleteText
+                )
+            } else selected = null
+        }
         canvas.restore()
 
         // 하단 안내
-        val hint = "박스는 끌어서 이동 · 빈 곳 탭하면 닫힘"
+        val hint = if (selected != null) "✕ 지우기 누르면 이 박스 삭제 · 빈 곳 탭하면 취소"
+                   else "박스 끌기=이동 · 박스 탭=지우기 · 빈 곳 탭=닫기"
         val tw = hintPaint.measureText(hint)
         val cx = width / 2f
         val cy = height - 64 * density
