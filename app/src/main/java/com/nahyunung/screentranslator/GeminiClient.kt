@@ -12,9 +12,9 @@ import java.net.URL
 import java.net.URLEncoder
 
 /**
- * 제미나이에 화면 캡처를 통째로 보내서
- * 글자 위치(box_2d) + 원문 + 한국어 번역을 한 번에 받아옴.
- * 세로쓰기·말풍선도 이미지로 직접 읽어서 ML Kit보다 훨씬 정확함.
+ * 제미나이에 화면 캡처를 통째로 보내서 글자 위치(box_2d) + 한국어 번역을 받아옴.
+ * - 스트리밍: 번역 박스가 하나 완성될 때마다 바로 onItem 호출 → 첫 결과가 빨리 뜸
+ * - 세로쓰기·말풍선도 이미지로 직접 읽어서 ML Kit보다 정확함
  * (네트워크 호출이라 반드시 백그라운드 스레드에서 호출)
  */
 object GeminiClient {
@@ -26,20 +26,21 @@ object GeminiClient {
         val badThinkConfig: Boolean = false
     ) : Exception(message)
 
-    /** 붐빌 때(503 등) 차례로 시도할 예비 모델 */
+    /** 붐비거나 느릴 때 차례로 시도할 예비 모델 (빠른 순) */
     private val FALLBACK_MODELS = listOf("gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-2.5-flash")
 
+    // 원문은 받지 않고 번역만 받음 → 응답 길이 절반, 속도 ↑
     private fun prompt(lang: SourceLang) = """
-        This is a screenshot of a phone screen. Find every piece of foreign (non-Korean) text on it,
-        mainly ${lang.englishName}, including UI labels, paragraphs, speech bubbles and VERTICAL text
-        (read vertical Japanese/Chinese columns top-to-bottom, right-to-left).
+        Translate this phone screenshot into Korean.
+        Find every piece of foreign (non-Korean) text, mainly ${lang.englishName}: UI labels, paragraphs,
+        speech bubbles and VERTICAL text (read vertical Japanese/Chinese columns top-to-bottom, right-to-left).
         Group text into natural units: one speech bubble, one paragraph, one button/label, one list item.
         Do not merge separate bubbles or separate UI elements.
+        Order units from top to bottom.
         For each unit return:
-          - box_2d: [ymin, xmin, ymax, xmax] tightly around the original text, normalized to 0-1000
-          - text: the original text
-          - ko: a natural, fluent Korean translation, using the context of the whole screen
-            (keep names consistent; for game/manga dialogue keep the tone and speech style)
+          b: [ymin, xmin, ymax, xmax] tightly around the original text, normalized to 0-1000
+          k: natural, fluent Korean translation using the whole screen as context
+             (keep names consistent; for game/manga dialogue keep the tone and speech style)
         Skip text that is already Korean, and skip lone numbers/symbols.
         Return only a JSON array. Return [] if there is nothing to translate.
     """.trimIndent()
@@ -63,10 +64,10 @@ object GeminiClient {
         val itemSchema = JSONObject()
             .put("type", "OBJECT")
             .put("properties", JSONObject()
-                .put("box_2d", JSONObject().put("type", "ARRAY").put("items", JSONObject().put("type", "INTEGER")))
-                .put("text", JSONObject().put("type", "STRING"))
-                .put("ko", JSONObject().put("type", "STRING")))
-            .put("required", JSONArray().put("box_2d").put("text").put("ko"))
+                .put("b", JSONObject().put("type", "ARRAY").put("items", JSONObject().put("type", "INTEGER")))
+                .put("k", JSONObject().put("type", "STRING")))
+            .put("required", JSONArray().put("b").put("k"))
+            .put("propertyOrdering", JSONArray().put("b").put("k"))
 
         val gen = JSONObject()
             .put("temperature", 0.2)
@@ -91,7 +92,7 @@ object GeminiClient {
             .toString()
     }
 
-    /** 긴 변 1600px로 줄임: 이미지 토큰이 줄어서 훨씬 빨라짐 (글자는 충분히 읽힘) */
+    /** 긴 변 1600px로 줄임: 이미지 토큰이 줄어서 빨라짐 (글자는 충분히 읽힘) */
     private fun toJpegBase64(src: Bitmap): String {
         val maxSide = 1600
         val longSide = maxOf(src.width, src.height)
@@ -107,9 +108,11 @@ object GeminiClient {
     }
 
     /**
+     * 번역 실행. 결과 박스가 하나 완성될 때마다 onItem 호출.
      * 붐비거나 느리면 → 같은 모델 1번 재시도(503만) → 예비 모델로 우회.
-     * @param onStatus 진행 상황 문구 (버튼 표시용, 백그라운드 스레드에서 호출됨)
-     * @return 화면 좌표로 변환된 번역 결과 목록
+     * @param onStatus 진행 상황 문구 (버튼 표시용)
+     * @return 받은 박스 개수
+     * (콜백은 모두 백그라운드 스레드에서 호출됨)
      */
     fun translate(
         bitmap: Bitmap,
@@ -118,8 +121,9 @@ object GeminiClient {
         model: String,
         screenW: Int,
         screenH: Int,
-        onStatus: (String) -> Unit = {}
-    ): List<OverlayItem> {
+        onStatus: (String) -> Unit = {},
+        onItem: (OverlayItem) -> Unit
+    ): Int {
         val jpeg = toJpegBase64(bitmap)
         val models = (listOf(model.trim().removePrefix("models/")) + FALLBACK_MODELS).distinct()
         var lastError: GeminiException? = null
@@ -131,17 +135,21 @@ object GeminiClient {
             var ti = 0
             while (ti < order.size) {
                 val think = order[ti]
+                var delivered = 0
                 try {
-                    val items = requestOnce(requestBody(jpeg, lang, think), m, apiKey, screenW, screenH)
+                    stream(requestBody(jpeg, lang, think), m, apiKey, screenW, screenH) {
+                        delivered++
+                        onItem(it)
+                    }
                     thinkCache[m] = think
-                    return items
+                    return delivered
                 } catch (e: GeminiException) {
+                    // 이미 박스를 일부 보여줬으면 다른 모델로 다시 하지 않고 거기서 끝
+                    if (delivered > 0) return delivered
                     lastError = e
                     when {
-                        // 이 모델이 해당 thinking 설정을 모름 → 다음 방식으로
-                        e.badThinkConfig -> ti++
-                        // 붐빔(503)은 같은 모델로 한 번만 더
-                        e.code == 503 && !busyRetried -> {
+                        e.badThinkConfig -> ti++ // 이 모델이 그 thinking 설정을 모름 → 다음 방식
+                        e.code == 503 && !busyRetried -> { // 붐빔은 같은 모델로 한 번만 더
                             busyRetried = true
                             onStatus("재시도")
                             Thread.sleep(1500)
@@ -155,19 +163,21 @@ object GeminiClient {
         throw lastError ?: GeminiException("제미나이 오류")
     }
 
-    private fun requestOnce(
+    /** SSE 스트리밍으로 받으면서 완성된 JSON 객체마다 onItem 호출 */
+    private fun stream(
         body: String,
         model: String,
         apiKey: String,
         screenW: Int,
-        screenH: Int
-    ): List<OverlayItem> {
+        screenH: Int,
+        onItem: (OverlayItem) -> Unit
+    ) {
         val modelId = URLEncoder.encode(model, "UTF-8")
-        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$modelId:generateContent")
+        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$modelId:streamGenerateContent?alt=sse")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 10_000
-            readTimeout = 30_000 // 30초 넘게 걸리면 포기하고 다음 모델로
+            readTimeout = 30_000 // 30초 동안 아무것도 안 오면 포기하고 다음 모델로
             doOutput = true
             setRequestProperty("Content-Type", "application/json; charset=utf-8")
             setRequestProperty("x-goog-api-key", apiKey.trim())
@@ -176,29 +186,37 @@ object GeminiClient {
         try {
             conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
-            val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)
-                ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
-
             if (code !in 200..299) {
-                val apiMsg = runCatching {
-                    JSONObject(resp).getJSONObject("error").getString("message")
-                }.getOrDefault(resp.take(200))
-                val thinkErr = code == 400 && apiMsg.contains("think", ignoreCase = true)
-                throw GeminiException(
-                    when (code) {
-                        400, 401, 403 -> "API 키나 모델 이름 확인해줘 ($code): $apiMsg"
-                        404 -> "모델($model)을 못 찾았어 ($code)"
-                        429 -> "무료 사용량 초과. 잠깐 뒤에 다시 (429)"
-                        500, 502, 503, 504 -> "구글 서버가 붐벼. 잠깐 뒤에 다시 눌러봐 ($code)"
-                        else -> "제미나이 오류 ($code): $apiMsg"
-                    },
-                    // 서버 혼잡·일시 오류·모델 없음·모델별 한도 초과는 다른 모델로 넘어감
-                    retryable = code in listOf(404, 429, 500, 502, 503, 504),
-                    code = code,
-                    badThinkConfig = thinkErr
-                )
+                val resp = conn.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+                throw httpError(code, resp, model)
             }
-            return parse(resp, screenW, screenH)
+
+            val extractor = JsonArrayStreamer { obj -> toItem(obj, screenW, screenH)?.let(onItem) }
+            var gotAnyText = false
+            conn.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    if (!line.startsWith("data:")) continue
+                    val json = line.substring(5).trim()
+                    if (json.isEmpty()) continue
+                    val root = JSONObject(json)
+                    root.optJSONObject("error")?.let {
+                        throw httpError(it.optInt("code", 500), json, model)
+                    }
+                    val parts = root.optJSONArray("candidates")?.optJSONObject(0)
+                        ?.optJSONObject("content")?.optJSONArray("parts") ?: continue
+                    for (i in 0 until parts.length()) {
+                        val p = parts.getJSONObject(i)
+                        if (p.optBoolean("thought")) continue
+                        val t = p.optString("text")
+                        if (t.isNotEmpty()) {
+                            gotAnyText = true
+                            extractor.feed(t)
+                        }
+                    }
+                }
+            }
+            if (!gotAnyText) throw GeminiException("응답이 비었어", retryable = true, code = -2)
         } catch (e: SocketTimeoutException) {
             throw GeminiException("응답이 너무 느려 (30초 초과)", retryable = true, code = -1)
         } finally {
@@ -206,41 +224,86 @@ object GeminiClient {
         }
     }
 
-    private fun parse(body: String, screenW: Int, screenH: Int): List<OverlayItem> {
-        val root = JSONObject(body)
-        val candidates = root.optJSONArray("candidates")
-        if (candidates == null || candidates.length() == 0) {
-            val reason = root.optJSONObject("promptFeedback")?.optString("blockReason")
-            throw GeminiException("응답이 비었어${if (!reason.isNullOrEmpty()) " ($reason)" else ""}")
-        }
-        val parts = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")
-            ?: throw GeminiException("응답 형식이 이상해")
-        val text = buildString {
-            for (i in 0 until parts.length()) append(parts.getJSONObject(i).optString("text"))
-        }.trim()
-            .removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+    private fun httpError(code: Int, resp: String, model: String): GeminiException {
+        val apiMsg = runCatching {
+            JSONObject(resp).getJSONObject("error").getString("message")
+        }.getOrDefault(resp.take(200))
+        val thinkErr = code == 400 && apiMsg.contains("think", ignoreCase = true)
+        return GeminiException(
+            when (code) {
+                400, 401, 403 -> "API 키나 모델 이름 확인해줘 ($code): $apiMsg"
+                404 -> "모델($model)을 못 찾았어 ($code)"
+                429 -> "무료 사용량 초과. 잠깐 뒤에 다시 (429)"
+                500, 502, 503, 504 -> "구글 서버가 붐벼. 잠깐 뒤에 다시 눌러봐 ($code)"
+                else -> "제미나이 오류 ($code): $apiMsg"
+            },
+            // 서버 혼잡·일시 오류·모델 없음·모델별 한도 초과는 다른 모델로 넘어감
+            retryable = code in listOf(404, 429, 500, 502, 503, 504),
+            code = code,
+            badThinkConfig = thinkErr
+        )
+    }
 
-        val arr = JSONArray(text)
-        val items = mutableListOf<OverlayItem>()
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            val ko = o.optString("ko").trim()
-            val b = o.optJSONArray("box_2d") ?: continue
-            if (ko.isEmpty() || b.length() < 4) continue
-            val ymin = b.optInt(0).coerceIn(0, 1000)
-            val xmin = b.optInt(1).coerceIn(0, 1000)
-            val ymax = b.optInt(2).coerceIn(0, 1000)
-            val xmax = b.optInt(3).coerceIn(0, 1000)
-            if (xmax <= xmin || ymax <= ymin) continue
-            items += OverlayItem(
-                rect = Rect(
-                    xmin * screenW / 1000, ymin * screenH / 1000,
-                    xmax * screenW / 1000, ymax * screenH / 1000
-                ),
-                text = ko,
-                lineCount = 1
-            )
+    private fun toItem(o: JSONObject, screenW: Int, screenH: Int): OverlayItem? {
+        val ko = o.optString("k").trim()
+        val b = o.optJSONArray("b") ?: return null
+        if (ko.isEmpty() || b.length() < 4) return null
+        val ymin = b.optInt(0).coerceIn(0, 1000)
+        val xmin = b.optInt(1).coerceIn(0, 1000)
+        val ymax = b.optInt(2).coerceIn(0, 1000)
+        val xmax = b.optInt(3).coerceIn(0, 1000)
+        if (xmax <= xmin || ymax <= ymin) return null
+        return OverlayItem(
+            rect = Rect(
+                xmin * screenW / 1000, ymin * screenH / 1000,
+                xmax * screenW / 1000, ymax * screenH / 1000
+            ),
+            text = ko,
+            lineCount = 1
+        )
+    }
+
+    /**
+     * 조각조각 들어오는 JSON 배열 텍스트에서
+     * 배열 바로 아래 객체 { ... } 가 완성될 때마다 꺼내 줌.
+     */
+    private class JsonArrayStreamer(private val onObject: (JSONObject) -> Unit) {
+        private val buf = StringBuilder()
+        private var pos = 0
+        private var depth = 0
+        private var inString = false
+        private var escape = false
+        private var objStart = -1
+
+        fun feed(chunk: String) {
+            buf.append(chunk)
+            while (pos < buf.length) {
+                val c = buf[pos]
+                if (inString) {
+                    when {
+                        escape -> escape = false
+                        c == '\\' -> escape = true
+                        c == '"' -> inString = false
+                    }
+                } else {
+                    when (c) {
+                        '"' -> inString = true
+                        '[', '{' -> {
+                            if (c == '{' && depth == 1) objStart = pos
+                            depth++
+                        }
+                        ']', '}' -> {
+                            depth--
+                            if (c == '}' && depth == 1 && objStart >= 0) {
+                                runCatching { JSONObject(buf.substring(objStart, pos + 1)) }
+                                    .getOrNull()?.let(onObject)
+                                objStart = -1
+                            }
+                        }
+                    }
+                }
+                pos++
+            }
         }
-        return items
     }
 }

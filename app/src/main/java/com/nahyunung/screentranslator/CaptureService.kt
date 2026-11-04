@@ -593,25 +593,44 @@ class CaptureService : Service() {
             .addOnCompleteListener { bmp.recycle() }
     }
 
+    /** 지금 번역 중인 요청 번호 (사용자가 중간에 닫으면 남은 결과 무시) */
+    private var aiSession = 0
+    private var aiClosedByUser = false
+
     private fun translateWithGemini(bmp: Bitmap) {
         val key = Prefs.apiKey(this)
         val model = Prefs.model(this)
         val l = lang
         val w = screenW
         val h = screenH
+        val session = ++aiSession
+        aiClosedByUser = false
+        val started = System.currentTimeMillis()
         setButtonState("AI…")
         net.execute {
-            val result = runCatching { GeminiClient.translate(bmp, l, key, model, w, h) { msg ->
-                    main.post { setButtonState(msg) }
-                }
+            val result = runCatching {
+                GeminiClient.translate(
+                    bmp, l, key, model, w, h,
+                    onStatus = { msg -> main.post { if (session == aiSession) setButtonState(msg) } },
+                    onItem = { item ->
+                        main.post {
+                            if (session != aiSession || aiClosedByUser) return@post
+                            // 첫 박스면 오버레이 띄우고, 이후엔 하나씩 추가
+                            val ov = overlay
+                            if (ov == null) showOverlay(listOf(item)) else ov.addItem(item)
+                        }
+                    }
+                )
             }
             bmp.recycle()
             main.post {
-                result.onSuccess { items ->
-                    if (items.isEmpty()) finishWork("번역할 외국어를 못 찾았어")
+                if (session != aiSession) return@post
+                result.onSuccess { count ->
+                    if (count == 0) finishWork("번역할 외국어를 못 찾았어")
                     else {
-                        showOverlay(items)
+                        val sec = (System.currentTimeMillis() - started) / 100 / 10.0
                         finishWork()
+                        if (Prefs.showTiming(this)) toast("${count}개 · ${sec}초")
                     }
                 }.onFailure { e ->
                     finishWork(
@@ -659,7 +678,10 @@ class CaptureService : Service() {
 
     private fun showOverlay(items: List<OverlayItem>) {
         removeOverlay()
-        val view = TranslateOverlayView(this, items) { removeOverlay() }
+        val view = TranslateOverlayView(this, items) {
+            aiClosedByUser = true // 스트리밍 중에 닫았으면 남은 박스는 안 띄움
+            removeOverlay()
+        }
         val p = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,

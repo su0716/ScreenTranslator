@@ -49,7 +49,7 @@ object Prefs {
     private const val KEY_ENGINE = "engine"
     private const val KEY_API = "gemini_api_key"
     private const val KEY_MODEL = "gemini_model"
-    const val DEFAULT_MODEL = "gemini-flash-latest"
+    const val DEFAULT_MODEL = "gemini-flash-lite-latest"
 
     private fun sp(ctx: Context) = ctx.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
@@ -65,6 +65,9 @@ object Prefs {
     fun model(ctx: Context): String =
         sp(ctx).getString(KEY_MODEL, DEFAULT_MODEL)?.takeIf { it.isNotBlank() } ?: DEFAULT_MODEL
     fun setModel(ctx: Context, m: String) = sp(ctx).edit().putString(KEY_MODEL, m.trim()).apply()
+
+    /** 번역 끝나면 걸린 시간 표시 (속도 확인용) */
+    fun showTiming(ctx: Context): Boolean = sp(ctx).getBoolean("show_timing", true)
 
     fun source(ctx: Context): SourceLang {
         val name = ctx.getSharedPreferences(FILE, Context.MODE_PRIVATE).getString(KEY_SRC, SourceLang.EN.name)

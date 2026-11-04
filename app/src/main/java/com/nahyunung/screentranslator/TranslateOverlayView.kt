@@ -28,7 +28,7 @@ data class OverlayItem(val rect: Rect, val text: String, val lineCount: Int)
 @SuppressLint("ViewConstructor")
 class TranslateOverlayView(
     context: Context,
-    private val items: List<OverlayItem>,
+    initialItems: List<OverlayItem>,
     private val onClose: () -> Unit
 ) : View(context) {
 
@@ -61,6 +61,7 @@ class TranslateOverlayView(
         textAlign = Paint.Align.CENTER
     }
 
+    private val items = initialItems.toMutableList()
     private var placed: MutableList<Placed>? = null
     private val loc = IntArray(2)
 
@@ -79,7 +80,22 @@ class TranslateOverlayView(
             .build()
 
     /** 각 박스에 들어가도록 글자 크기를 줄여가며 맞춤. 그래도 넘치면 박스를 아래로 늘림. */
-    private fun place(screenW: Int): MutableList<Placed> = items.map { item ->
+    /** 스트리밍으로 들어온 박스 하나 추가 */
+    fun addItem(item: OverlayItem) {
+        items.add(item)
+        placed?.let { list ->
+            getLocationOnScreen(loc)
+            // 잡고 있는 박스가 계속 맨 위에 오도록 그 아래에 끼워 넣음
+            val idx = dragging?.let { list.indexOf(it) }?.takeIf { it >= 0 } ?: list.size
+            list.add(idx, placeOne(item, loc[0] + width))
+        }
+        invalidate()
+    }
+
+    private fun place(screenW: Int): MutableList<Placed> =
+        items.map { placeOne(it, screenW) }.toMutableList()
+
+    private fun placeOne(item: OverlayItem, screenW: Int): Placed {
         val r = item.rect
         var boxW = max(r.width().toFloat(), 48 * density)
         // 세로쓰기 칸(좁고 긴 박스)은 한국어 가로쓰기가 들어가도록 넓혀서 가운데 정렬
@@ -104,8 +120,8 @@ class TranslateOverlayView(
         // 세로 박스는 글이 들어갈 만큼만 높이 사용, 가로 박스는 원문을 덮도록
         val boxH = if (vertical) layout.height + 2 * pad
                    else max(r.height().toFloat(), layout.height + 2 * pad)
-        Placed(RectF(left, r.top.toFloat(), left + boxW, r.top + boxH), layout)
-    }.toMutableList()
+        return Placed(RectF(left, r.top.toFloat(), left + boxW, r.top + boxH), layout)
+    }
 
     private fun ensurePlaced(): MutableList<Placed> {
         getLocationOnScreen(loc)
