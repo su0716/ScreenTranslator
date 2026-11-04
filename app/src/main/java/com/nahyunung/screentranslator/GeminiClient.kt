@@ -7,6 +7,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.URLEncoder
 
@@ -18,10 +19,15 @@ import java.net.URLEncoder
  */
 object GeminiClient {
 
-    class GeminiException(message: String, val retryable: Boolean = false) : Exception(message)
+    class GeminiException(
+        message: String,
+        val retryable: Boolean = false,
+        val code: Int = 0,
+        val badThinkConfig: Boolean = false
+    ) : Exception(message)
 
     /** 붐빌 때(503 등) 차례로 시도할 예비 모델 */
-    private val FALLBACK_MODELS = listOf("gemini-flash-lite-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite")
+    private val FALLBACK_MODELS = listOf("gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-2.5-flash")
 
     private fun prompt(lang: SourceLang) = """
         This is a screenshot of a phone screen. Find every piece of foreign (non-Korean) text on it,
@@ -38,7 +44,22 @@ object GeminiClient {
         Return only a JSON array. Return [] if there is nothing to translate.
     """.trimIndent()
 
-    private fun requestBody(jpegBase64: String, lang: SourceLang): String {
+    /**
+     * "생각(thinking)" 끄는 방식이 모델 세대마다 달라서 순서대로 시도.
+     * 3.x: thinkingLevel, 2.5: thinkingBudget=0, 그 외: 설정 안 함
+     */
+    private enum class Think { LEVEL_MINIMAL, LEVEL_LOW, BUDGET_0, NONE }
+
+    /** 모델별로 성공한 방식 기억 (앱 켜져 있는 동안) */
+    private val thinkCache = mutableMapOf<String, Think>()
+
+    private fun thinkOrder(model: String): List<Think> {
+        thinkCache[model]?.let { return listOf(it) + Think.values().filter { t -> t != it } }
+        return if (model.contains("2.5") || model.contains("2.0")) listOf(Think.BUDGET_0, Think.NONE)
+        else listOf(Think.LEVEL_MINIMAL, Think.LEVEL_LOW, Think.BUDGET_0, Think.NONE)
+    }
+
+    private fun requestBody(jpegBase64: String, lang: SourceLang, think: Think): String {
         val itemSchema = JSONObject()
             .put("type", "OBJECT")
             .put("properties", JSONObject()
@@ -46,6 +67,17 @@ object GeminiClient {
                 .put("text", JSONObject().put("type", "STRING"))
                 .put("ko", JSONObject().put("type", "STRING")))
             .put("required", JSONArray().put("box_2d").put("text").put("ko"))
+
+        val gen = JSONObject()
+            .put("temperature", 0.2)
+            .put("responseMimeType", "application/json")
+            .put("responseSchema", JSONObject().put("type", "ARRAY").put("items", itemSchema))
+        when (think) {
+            Think.LEVEL_MINIMAL -> gen.put("thinkingConfig", JSONObject().put("thinkingLevel", "minimal"))
+            Think.LEVEL_LOW -> gen.put("thinkingConfig", JSONObject().put("thinkingLevel", "low"))
+            Think.BUDGET_0 -> gen.put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+            Think.NONE -> Unit
+        }
 
         return JSONObject()
             .put("contents", JSONArray().put(JSONObject()
@@ -55,15 +87,27 @@ object GeminiClient {
                         .put("mime_type", "image/jpeg")
                         .put("data", jpegBase64)))
                     .put(JSONObject().put("text", prompt(lang))))))
-            .put("generationConfig", JSONObject()
-                .put("temperature", 0.2)
-                .put("responseMimeType", "application/json")
-                .put("responseSchema", JSONObject().put("type", "ARRAY").put("items", itemSchema)))
+            .put("generationConfig", gen)
             .toString()
     }
 
+    /** 긴 변 1600px로 줄임: 이미지 토큰이 줄어서 훨씬 빨라짐 (글자는 충분히 읽힘) */
+    private fun toJpegBase64(src: Bitmap): String {
+        val maxSide = 1600
+        val longSide = maxOf(src.width, src.height)
+        val bmp = if (longSide > maxSide) {
+            val s = maxSide.toFloat() / longSide
+            Bitmap.createScaledBitmap(src, (src.width * s).toInt(), (src.height * s).toInt(), true)
+        } else src
+        return ByteArrayOutputStream().use { out ->
+            bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
+            if (bmp !== src) bmp.recycle()
+            Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+        }
+    }
+
     /**
-     * 붐비면 잠깐 쉬고 재시도 → 그래도 안 되면 예비 모델로 시도.
+     * 붐비거나 느리면 → 같은 모델 1번 재시도(503만) → 예비 모델로 우회.
      * @param onStatus 진행 상황 문구 (버튼 표시용, 백그라운드 스레드에서 호출됨)
      * @return 화면 좌표로 변환된 번역 결과 목록
      */
@@ -76,26 +120,35 @@ object GeminiClient {
         screenH: Int,
         onStatus: (String) -> Unit = {}
     ): List<OverlayItem> {
-        val jpeg = ByteArrayOutputStream().use { out ->
-            bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
-            Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
-        }
-        val body = requestBody(jpeg, lang)
-
-        val models = (listOf(model.trim()) + FALLBACK_MODELS).distinct()
+        val jpeg = toJpegBase64(bitmap)
+        val models = (listOf(model.trim().removePrefix("models/")) + FALLBACK_MODELS).distinct()
         var lastError: GeminiException? = null
+
         for ((mi, m) in models.withIndex()) {
-            // 주 모델은 2번 재시도, 예비 모델은 1번씩
-            val attempts = if (mi == 0) 3 else 1
-            for (attempt in 0 until attempts) {
-                if (mi > 0) onStatus("우회중")
-                else if (attempt > 0) onStatus("재시도")
+            if (mi > 0) onStatus("우회중")
+            var busyRetried = false
+            val order = thinkOrder(m)
+            var ti = 0
+            while (ti < order.size) {
+                val think = order[ti]
                 try {
-                    return requestOnce(body, m, apiKey, screenW, screenH)
+                    val items = requestOnce(requestBody(jpeg, lang, think), m, apiKey, screenW, screenH)
+                    thinkCache[m] = think
+                    return items
                 } catch (e: GeminiException) {
                     lastError = e
-                    if (!e.retryable) throw e
-                    if (attempt < attempts - 1) Thread.sleep(1500L * (attempt + 1))
+                    when {
+                        // 이 모델이 해당 thinking 설정을 모름 → 다음 방식으로
+                        e.badThinkConfig -> ti++
+                        // 붐빔(503)은 같은 모델로 한 번만 더
+                        e.code == 503 && !busyRetried -> {
+                            busyRetried = true
+                            onStatus("재시도")
+                            Thread.sleep(1500)
+                        }
+                        e.retryable -> break // 다음 모델로
+                        else -> throw e
+                    }
                 }
             }
         }
@@ -109,12 +162,12 @@ object GeminiClient {
         screenW: Int,
         screenH: Int
     ): List<OverlayItem> {
-        val modelId = URLEncoder.encode(model.trim().removePrefix("models/"), "UTF-8")
+        val modelId = URLEncoder.encode(model, "UTF-8")
         val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$modelId:generateContent")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
-            connectTimeout = 15_000
-            readTimeout = 90_000
+            connectTimeout = 10_000
+            readTimeout = 30_000 // 30초 넘게 걸리면 포기하고 다음 모델로
             doOutput = true
             setRequestProperty("Content-Type", "application/json; charset=utf-8")
             setRequestProperty("x-goog-api-key", apiKey.trim())
@@ -130,6 +183,7 @@ object GeminiClient {
                 val apiMsg = runCatching {
                     JSONObject(resp).getJSONObject("error").getString("message")
                 }.getOrDefault(resp.take(200))
+                val thinkErr = code == 400 && apiMsg.contains("think", ignoreCase = true)
                 throw GeminiException(
                     when (code) {
                         400, 401, 403 -> "API 키나 모델 이름 확인해줘 ($code): $apiMsg"
@@ -139,10 +193,14 @@ object GeminiClient {
                         else -> "제미나이 오류 ($code): $apiMsg"
                     },
                     // 서버 혼잡·일시 오류·모델 없음·모델별 한도 초과는 다른 모델로 넘어감
-                    retryable = code in listOf(404, 429, 500, 502, 503, 504)
+                    retryable = code in listOf(404, 429, 500, 502, 503, 504),
+                    code = code,
+                    badThinkConfig = thinkErr
                 )
             }
             return parse(resp, screenW, screenH)
+        } catch (e: SocketTimeoutException) {
+            throw GeminiException("응답이 너무 느려 (30초 초과)", retryable = true, code = -1)
         } finally {
             conn.disconnect()
         }
