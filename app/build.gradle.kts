@@ -11,8 +11,20 @@ android {
         applicationId = "com.nahyunung.screentranslator"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1"
+        // GitHub 빌드 번호를 버전으로 사용 (로컬 빌드는 1)
+        val build = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
+        versionCode = build
+        versionName = "0.1.$build"
+    }
+
+    // 고정 서명키: 빌드할 때마다 같은 키로 서명돼서 새 APK를 덮어쓰기 설치 가능
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     buildTypes {
